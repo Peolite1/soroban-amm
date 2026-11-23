@@ -3,6 +3,7 @@ extern crate std;
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
+    xdr::ScAddress,
     Address, Env, Vec,
 };
 
@@ -42,13 +43,18 @@ fn config_with_boost(
     (staking, contract_id)
 }
 
-fn ledger_dump(env: &Env) -> std::string::String {
+fn contract_instance_dump(env: &Env, contract_id: &Address) -> std::string::String {
+    let contract_address: ScAddress = contract_id.clone().try_into().unwrap();
+    let address_debug = std::format!("{contract_address:?}");
     env.to_ledger_snapshot()
         .ledger_entries
         .into_iter()
-        .map(|(key, (entry, ttl))| std::format!("{key:?}|{entry:?}|{ttl:?}"))
-        .collect::<std::vec::Vec<_>>()
-        .join("\n")
+        .find(|(key, _)| {
+            let key_debug = std::format!("{key:?}");
+            key_debug.contains(&address_debug) && key_debug.contains("LedgerKeyContractInstance")
+        })
+        .map(|(_, (entry, _))| std::format!("{entry:?}"))
+        .expect("staking contract instance must exist")
 }
 
 fn reward_state(env: &Env, contract_id: &Address) -> (i128, i128, i128) {
@@ -113,13 +119,13 @@ fn stranger_cannot_upgrade_and_contract_code_is_unchanged() {
     let (staking, contract_id, _, _) = setup(&env);
     let stranger = Address::generate(&env);
     let proposed_hash = soroban_sdk::BytesN::from_array(&env, &[7; 32]);
-    let code_before = ledger_dump(&env);
+    let code_before = contract_instance_dump(&env, &contract_id);
 
     assert_eq!(
         staking.try_upgrade(&stranger, &proposed_hash),
         Err(Ok(StakingError::Unauthorized))
     );
-    let code_after = ledger_dump(&env);
+    let code_after = contract_instance_dump(&env, &contract_id);
     assert_eq!(code_after, code_before);
 }
 

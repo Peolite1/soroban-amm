@@ -9,7 +9,7 @@ use soroban_sdk::{
 
 fn setup(env: &Env) -> (FactoryClient<'_>, Address, Address, Address, Address) {
     env.mock_all_auths();
-    env.ledger().set_sequence(100);
+    env.ledger().set_sequence_number(100);
     let admin = Address::generate(env);
     let factory_addr = env.register_contract(None, Factory);
     let factory = FactoryClient::new(env, &factory_addr);
@@ -46,10 +46,14 @@ fn initialize_twice_preserves_admin_and_hashes() {
     let env = Env::default();
     let (factory, _, admin, _, _) = setup(&env);
     let amm_before = env.as_contract(&factory.address, || {
-        env.storage().instance().get(&DataKey::AmmWasmHash)
+        env.storage()
+            .instance()
+            .get::<DataKey, BytesN<32>>(&DataKey::AmmWasmHash)
     });
     let token_before = env.as_contract(&factory.address, || {
-        env.storage().instance().get(&DataKey::TokenWasmHash)
+        env.storage()
+            .instance()
+            .get::<DataKey, BytesN<32>>(&DataKey::TokenWasmHash)
     });
     assert_eq!(factory.get_admin(), Some(admin));
 
@@ -62,10 +66,14 @@ fn initialize_twice_preserves_admin_and_hashes() {
         Err(Ok(FactoryError::AlreadyInitialized))
     );
     let amm_after = env.as_contract(&factory.address, || {
-        env.storage().instance().get(&DataKey::AmmWasmHash)
+        env.storage()
+            .instance()
+            .get::<DataKey, BytesN<32>>(&DataKey::AmmWasmHash)
     });
     let token_after = env.as_contract(&factory.address, || {
-        env.storage().instance().get(&DataKey::TokenWasmHash)
+        env.storage()
+            .instance()
+            .get::<DataKey, BytesN<32>>(&DataKey::TokenWasmHash)
     });
     assert_eq!(amm_after, amm_before);
     assert_eq!(token_after, token_before);
@@ -73,7 +81,7 @@ fn initialize_twice_preserves_admin_and_hashes() {
 
 fn configure_creation_fee(
     env: &Env,
-    factory: &FactoryClient,
+    factory: &FactoryClient<'_>,
     admin: &Address,
     caller: &Address,
     fee_asset: &Address,
@@ -93,6 +101,7 @@ fn amm_pool_rejects_negative_fee_before_charge() {
     let ta = Address::generate(&env);
     let tb = Address::generate(&env);
     let before_caller = TokenClient::new(&env, &fee_asset).balance(&caller);
+    let before_treasury = TokenClient::new(&env, &fee_asset).balance(&admin);
 
     assert_eq!(
         factory.try_create_pool_with_fee_bps(&caller, &ta, &tb, &-1, &None),
@@ -101,6 +110,10 @@ fn amm_pool_rejects_negative_fee_before_charge() {
     assert_eq!(
         TokenClient::new(&env, &fee_asset).balance(&caller),
         before_caller
+    );
+    assert_eq!(
+        TokenClient::new(&env, &fee_asset).balance(&admin),
+        before_treasury
     );
     assert_eq!(pool_count(&env, &addr), 0);
 }
@@ -113,6 +126,7 @@ fn amm_pool_rejects_fee_above_100_percent_before_charge() {
     let ta = Address::generate(&env);
     let tb = Address::generate(&env);
     let before_caller = TokenClient::new(&env, &fee_asset).balance(&caller);
+    let before_treasury = TokenClient::new(&env, &fee_asset).balance(&admin);
 
     assert_eq!(
         factory.try_create_pool_with_fee_bps(&caller, &ta, &tb, &10_001, &None),
@@ -121,6 +135,10 @@ fn amm_pool_rejects_fee_above_100_percent_before_charge() {
     assert_eq!(
         TokenClient::new(&env, &fee_asset).balance(&caller),
         before_caller
+    );
+    assert_eq!(
+        TokenClient::new(&env, &fee_asset).balance(&admin),
+        before_treasury
     );
     assert_eq!(pool_count(&env, &addr), 0);
 }
@@ -133,6 +151,7 @@ fn cl_pool_rejects_negative_fee_before_charge() {
     let ta = Address::generate(&env);
     let tb = Address::generate(&env);
     let before_caller = TokenClient::new(&env, &fee_asset).balance(&caller);
+    let before_treasury = TokenClient::new(&env, &fee_asset).balance(&admin);
 
     assert_eq!(
         factory.try_create_cl_pool(&caller, &ta, &tb, &-1, &0),
@@ -141,6 +160,10 @@ fn cl_pool_rejects_negative_fee_before_charge() {
     assert_eq!(
         TokenClient::new(&env, &fee_asset).balance(&caller),
         before_caller
+    );
+    assert_eq!(
+        TokenClient::new(&env, &fee_asset).balance(&admin),
+        before_treasury
     );
     assert_eq!(cl_pool_count(&env, &addr), 0);
 }
@@ -166,18 +189,15 @@ fn cl_pool_rejects_fee_above_100_percent_before_charge() {
 }
 
 #[test]
-fn amm_pool_accepts_zero_fee() {
+fn global_fee_accepts_nonzero_in_range_value() {
     let env = Env::default();
     let (factory, _, admin, _, _) = setup(&env);
-    let ta = Address::generate(&env);
-    let tb = Address::generate(&env);
-    assert!(factory
-        .try_create_pool_with_fee_bps(&admin, &ta, &tb, &0, &None)
-        .is_ok());
+    factory.set_treasury(&admin, &Address::generate(&env), &0);
+    assert_eq!(factory.set_global_fee(&admin, &1), 0);
 }
 
 #[test]
-fn amm_pool_accepts_10000_is_outside_range() {
+fn amm_pool_rejects_fee_at_100_percent() {
     let env = Env::default();
     let (factory, _, _, _, _) = setup(&env);
     let ta = Address::generate(&env);

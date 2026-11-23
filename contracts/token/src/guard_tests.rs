@@ -1,10 +1,7 @@
 extern crate std;
 
 use super::*;
-use soroban_sdk::{
-    testutils::{Address as _, Ledger},
-    Address, Env, String,
-};
+use soroban_sdk::{testutils::Address as _, Address, Env, String};
 
 struct TokenFixture {
     env: Env,
@@ -33,24 +30,6 @@ fn setup() -> TokenFixture {
         locker,
         contract,
     }
-}
-
-fn snapshot(f: &TokenFixture) -> (i128, i128, i128, usize) {
-    let client = LpTokenClient::new(&f.env, &f.contract);
-    let holder = Address::generate(&f.env);
-    let event_count = f.env.events().all().len();
-    (
-        client.total_supply(),
-        client.balance(&holder),
-        f.env.as_contract(&f.contract, || {
-            f.env
-                .storage()
-                .persistent()
-                .get(&DataKey::Locked(holder))
-                .unwrap_or(0)
-        }),
-        event_count,
-    )
 }
 
 #[test]

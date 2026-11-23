@@ -4,9 +4,9 @@ use super::*;
 use amm::{AmmPool, AmmPoolClient};
 use proptest::prelude::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
+    testutils::{Address as _, Events as _, Ledger},
     token::StellarAssetClient,
-    Address, Env,
+    Address, Env, IntoVal,
 };
 use token::{LpToken, LpTokenClient};
 
@@ -67,6 +67,16 @@ fn create_campaign(
     let id = client.create_campaign(gov, pool, lp, reward, &1_000, &2_000, &100, &100_000);
     client.stake(provider, &id, &100);
     id
+}
+
+fn leftover_recovery_event_count(env: &Env, incentives: &Address) -> usize {
+    let wanted: soroban_sdk::Vec<soroban_sdk::Val> =
+        (Symbol::new(env, "leftover_recovered"),).into_val(env);
+    env.events()
+        .all()
+        .iter()
+        .filter(|event| &event.0 == incentives && event.1 == wanted)
+        .count()
 }
 
 #[test]
@@ -161,9 +171,9 @@ fn recovery_event_is_emitted_once() {
     let id = create_campaign(&env, &incentives, &pool, &lp, &reward, &provider, &gov);
     env.ledger()
         .set_timestamp(2_000 + DEFAULT_CLAIM_GRACE_SECS + 1);
-    let before = env.events().all().len();
+    let before = leftover_recovery_event_count(&env, &incentives);
     client.recover_leftover_funds(&gov, &id, &treasury);
-    assert_eq!(env.events().all().len(), before + 1);
+    assert_eq!(leftover_recovery_event_count(&env, &incentives), before + 1);
 }
 
 #[test]
@@ -290,9 +300,9 @@ fn second_recovery_has_no_extra_event() {
     env.ledger()
         .set_timestamp(2_000 + DEFAULT_CLAIM_GRACE_SECS + 1);
     client.recover_leftover_funds(&gov, &id, &treasury);
-    let events = env.events().all().len();
+    let events = leftover_recovery_event_count(&env, &incentives);
     let _ = client.try_recover_leftover_funds(&gov, &id, &treasury);
-    assert_eq!(env.events().all().len(), events);
+    assert_eq!(leftover_recovery_event_count(&env, &incentives), events);
 }
 
 proptest! {
@@ -300,30 +310,52 @@ proptest! {
 
     #[test]
     fn conservation_property_claims_plus_recovery_never_exceed_funding(
-        funding in 1_i128..1_000_000,
-        claim_count in 0_u8..16,
-        recover in any::<bool>(),
+        distributed in 0_i128..=100_000,
     ) {
-        let mut claimed = 0_i128;
-        for i in 0..claim_count {
-            if claimed < funding {
-                let remaining = funding - claimed;
-                let claim = ((i as i128 + 1) * 7919).rem_euclid(remaining + 1);
-                claimed += claim;
-            }
-        }
-        let leftover = if recover { (funding - claimed).max(0) } else { 0 };
-        prop_assert!(claimed + leftover <= funding);
+        let (env, incentives, pool, lp, reward, provider, gov, treasury) = setup();
+        let client = IncentiveCampaignsClient::new(&env, &incentives);
+        let id = create_campaign(&env, &incentives, &pool, &lp, &reward, &provider, &gov);
+        env.ledger().set_timestamp(2_000 + DEFAULT_CLAIM_GRACE_SECS + 1);
+        env.as_contract(&incentives, || {
+            let mut campaign: Campaign = env.storage().persistent().get(&DataKey::Campaign(id)).unwrap();
+            campaign.total_distributed = distributed;
+            env.storage().persistent().set(&DataKey::Campaign(id), &campaign);
+        });
+
+        let recovered = if distributed == 100_000 {
+            prop_assert_eq!(
+                client.try_recover_leftover_funds(&gov, &id, &treasury),
+                Err(Ok(IncentiveError::NoLeftoverFunds))
+            );
+            0
+        } else {
+            client.recover_leftover_funds(&gov, &id, &treasury)
+        };
+        prop_assert!(distributed + recovered <= 100_000);
     }
 
     #[test]
-    fn repeated_or_full_recovery_never_changes_funding_conservation(
-        funding in 1_i128..1_000_000,
-        distributed in 0_i128..1_000_000,
-        repeated in any::<bool>(),
+    fn recovery_after_full_or_over_distribution_is_rejected(
+        over_distribution in 0_i128..100_000,
     ) {
-        let distributed = distributed.min(funding);
-        let leftover = if repeated { 0 } else { (funding - distributed).max(0) };
-        prop_assert!(distributed + leftover <= funding);
+        let (env, incentives, pool, lp, reward, provider, gov, treasury) = setup();
+        let client = IncentiveCampaignsClient::new(&env, &incentives);
+        let id = create_campaign(&env, &incentives, &pool, &lp, &reward, &provider, &gov);
+        env.ledger().set_timestamp(2_000 + DEFAULT_CLAIM_GRACE_SECS + 1);
+        env.as_contract(&incentives, || {
+            let mut campaign: Campaign = env.storage().persistent().get(&DataKey::Campaign(id)).unwrap();
+            campaign.total_distributed = campaign.funding_amount + over_distribution;
+            env.storage().persistent().set(&DataKey::Campaign(id), &campaign);
+        });
+
+        let reward_token = soroban_sdk::token::TokenClient::new(&env, &reward);
+        let contract_balance = reward_token.balance(&incentives);
+        let treasury_balance = reward_token.balance(&treasury);
+        prop_assert_eq!(
+            client.try_recover_leftover_funds(&gov, &id, &treasury),
+            Err(Ok(IncentiveError::NoLeftoverFunds))
+        );
+        prop_assert_eq!(reward_token.balance(&incentives), contract_balance);
+        prop_assert_eq!(reward_token.balance(&treasury), treasury_balance);
     }
 }
