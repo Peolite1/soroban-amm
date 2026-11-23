@@ -3004,6 +3004,9 @@ mod tests {
 }
 
 #[cfg(test)]
+mod guard_tests;
+
+#[cfg(test)]
 mod tests_issue_1112;
 
 #[cfg(test)]
