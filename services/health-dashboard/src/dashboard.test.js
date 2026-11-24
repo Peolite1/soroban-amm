@@ -610,6 +610,26 @@ test("renderPoolsOverview creates a table with all pools", () => {
   assert.ok(html.includes("CCC"));
 });
 
+test("renderPoolsOverview renders hostile pool data as inert text", () => {
+  const doc = installFakeDocument(["metrics-grid"]);
+  const xss = '<img src=x onerror="window.__xss=1">';
+  const stats = [{
+    poolId: "pool-a", tokenA: xss, tokenB: "BBB",
+    tvl: 10_000_000, volume24h: 5_000_000, fees24h: 100_000,
+    swapCount: 100, priceDeviationBps: 50,
+  }];
+  renderPoolsOverview(stats);
+  const grid = doc.getElementById("metrics-grid");
+  const row = grid.children[0].children[0].children[1].children[0];
+  assert.equal(row.children.length, 8);
+  const tokenACell = row.children[1];
+  assert.equal(tokenACell.tagName, "td");
+  assert.equal(tokenACell.textContent, xss);
+  assert.equal(tokenACell.children.length, 0);
+  assert.equal(tokenACell.innerHTML, "");
+  assert.ok(row.children.every((cell) => cell.children.length === 0 && cell.innerHTML === ""));
+});
+
 test("renderPoolsOverview shows empty state when no stats", () => {
   const doc = installFakeDocument(["metrics-grid"]);
   renderPoolsOverview([]);

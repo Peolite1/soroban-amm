@@ -42,7 +42,7 @@ pub mod cl;
 
 use proptest::prelude::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
+    testutils::Address as _,
     token::{StellarAssetClient, TokenClient as StellarTokenClient},
     Address, Env,
 };

@@ -533,6 +533,14 @@ describe("management API over HTTP", () => {
     assert.ok(authed.poller);
   });
 
+  it("exposes the dead-letter eviction counter on /metrics", async () => {
+    const response = await call(service, "GET", "/metrics", { token: TOKEN });
+    assert.equal(response.status, 200);
+    const metrics = JSON.parse(response.text) as { deadLetterEvictions?: number };
+    assert.equal(typeof metrics.deadLetterEvictions, "number");
+    assert.equal(metrics.deadLetterEvictions, 0);
+  });
+
   it("never returns, or logs, a configured secret", async () => {
     const created = await call(service, "POST", "/webhooks", {
       token: TOKEN,

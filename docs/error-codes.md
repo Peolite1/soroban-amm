@@ -184,6 +184,7 @@ Defined in [contracts/batch_router/src/lib.rs](../contracts/batch_router/src/lib
 | 13 | `Unauthorized` | The address supplied as admin to `pause`/`unpause`/`propose_admin`/`upgrade` is not the stored admin, or `accept_admin` was called with an address other than the pending nominee. | Pass the current admin (or the nominee) and sign as that address. |
 | 14 | `NoPendingAdmin` | `accept_admin` called while no `propose_admin` nomination is pending. | Have the admin call `propose_admin` first. |
 | 15 | `Paused` | The router is paused by its admin; returned by `execute_batch`, `simulate_batch` and `validate_batch` alike. | Wait for the admin to call `unpause`. |
+| 16 | `InvalidToken` | A CL `SwapOp` named a `token_in` the pool does not trade, or a `zero_for_one` direction contradicted by that token. | Use one of the pool's tokens and set `zero_for_one = true` for token A, `false` for token B. |
 
 ---
 

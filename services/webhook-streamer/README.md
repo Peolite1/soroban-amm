@@ -38,6 +38,7 @@ npm run build && npm start
 | `MANAGEMENT_MAX_BODY_BYTES` | `65536`                           | Largest request body the management API accepts; bigger bodies get `413`. |
 | `WEBHOOK_LEGACY_SECRET_HEADER` | `false`                        | Set to `true` to also send the deprecated `X-Webhook-Secret` header (the raw secret) for one release. See [Migrating from `X-Webhook-Secret`](#migrating-from-x-webhook-secret). |
 | `WEBHOOK_ALLOW_PRIVATE_TARGETS` | `false`                       | Set to `true` to allow registering webhook URLs that point at loopback/link-local/private-range addresses. Only for local development against a same-host test receiver — leave unset in production, since it disables SSRF protection on `POST /webhooks`. |
+| `DEAD_LETTER_MAX` | `1000`                             | Maximum retained dead letters. When full, the oldest entry is evicted, logged as a warning naming its entry/event/subscription ids, and counted in `deadLetterEvictions` on `GET /metrics`. |
 
 ## Management API
 
@@ -201,10 +202,10 @@ a receiver could not tell a fresh event from a replay. To migrate:
 
 ## Delivery guarantees
 
-- **At least once.** An event is delivered one or more times, never zero. The
-  poller saves each contract's cursor only after the events in that page have
-  been handed to the dispatcher, so a crash or restart between delivery and
-  the cursor write replays the page instead of skipping it. Receivers must
+- **At least once.** An event is attempted for delivery one or more times, never
+  zero. The poller saves each contract's cursor only after the events in that
+  page have been handed to the dispatcher, so a crash or restart between delivery
+  and the cursor write replays the page instead of skipping it. Receivers must
   deduplicate (see below).
 - Every delivery carries `X-Webhook-Id`, the event id. It is the same on every
   retry, dead-letter replay and post-restart redelivery, so it is the key to
@@ -212,6 +213,12 @@ a receiver could not tell a fresh event from a replay. To migrate:
 - Up to 3 retries with exponential back-off (500 ms, 1 s, 2 s).
 - Failed deliveries are logged but do not block other webhooks. Deliveries that
   exhaust their retries go to the dead-letter queue and can be replayed.
+- The dead-letter queue is bounded by `DEAD_LETTER_MAX` (default `1000`). Once
+  full, the oldest permanently-failed entry is evicted to make room for a new
+  one. Every eviction emits a `[dead-letter] evicted oldest entry` warning with
+  the entry, event and subscription ids, and increments the
+  `deadLetterEvictions` counter in `GET /metrics`. The counter is process-local
+  and starts at zero on restart.
 - A non-2xx response or an RPC `error` is logged at error level and surfaced
   on the health output; polling resumes on the next tick.
 

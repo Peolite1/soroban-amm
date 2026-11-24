@@ -6027,7 +6027,7 @@
               "type_": "address"
             },
             {
-              "doc": "Swap direction for concentrated-liquidity venues: `true` swaps token A\\nfor token B (price decreasing). Unused for `PoolType::Amm`.",
+              "doc": "Swap direction for concentrated-liquidity venues: `true` swaps token A\\nfor token B (price decreasing), so `token_in` must be token A; `false`\\nrequires `token_in` to be token B. Unused for `PoolType::Amm`.",
               "name": "zero_for_one",
               "type_": "bool"
             }
@@ -6584,6 +6584,11 @@
               "doc": "The router is paused by its admin. Returned by `execute_batch`,\\n`simulate_batch` and `validate_batch` alike so the pre-flight never\\ndisagrees with execution.",
               "name": "Paused",
               "value": 15
+            },
+            {
+              "doc": "",
+              "name": "InvalidToken",
+              "value": 16
             }
           ],
           "doc": "Errors returned by [`BatchRouter`] entry points.\\n\\nSee `docs/error-codes.md` for the full description of each variant.",

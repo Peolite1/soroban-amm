@@ -290,12 +290,14 @@ export class WebhookDispatcher {
   metrics(): MetricsSnapshot {
     return {
       ...this.counters,
+      deadLetterEvictions: this.deadLetters.evictions,
       circuits: this.circuitBreaker.snapshots(),
     };
   }
 
   /** Zero the counters. Exposed for tests. */
   resetMetrics(): void {
+    this.deadLetters.resetEvictions();
     this.counters = {
       attempted: 0,
       succeeded: 0,
