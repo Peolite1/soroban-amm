@@ -25850,7 +25850,7 @@
                 ]
               }
             },
-            {
+              {
               "tuple_v0": {
                 "doc": "Live schedule ids for a beneficiary, in creation order. Maintained by\\n`create_vesting`, `change_beneficiary` and `revoke_vesting` so the exact\\nset of schedules can be enumerated without gaps.",
                 "name": "SchedulesOf",
@@ -25858,9 +25858,14 @@
                   "address"
                 ]
               }
+            },
+            {
+              "void_v0": {
+                "doc": "Contract-wide pause flag. Set by `pause`, cleared by `unpause`.",
+                "name": "Paused"
+              }
             }
-          ],
-          "doc": "",
+          ],          "doc": "",
           "lib": "",
           "name": "DataKey"
         }
@@ -26254,10 +26259,15 @@
               "name": "TooManySchedules",
               "value": 12
             },
-            {
+                {
               "doc": "`lp_token` is not an LP token administered by `pool`, or is not an LP\\ntoken at all.",
               "name": "LpTokenMismatch",
               "value": 13
+            },
+            {
+              "doc": "Governance-gated mutations are blocked while the contract is paused.",
+              "name": "Paused",
+              "value": 14
             }
           ],
           "doc": "",

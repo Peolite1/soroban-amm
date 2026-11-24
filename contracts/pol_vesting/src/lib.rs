@@ -3,6 +3,21 @@
 //! Governance can create time-based vesting schedules for LP tokens so that
 //! protocol-owned liquidity cannot be withdrawn in a single governance vote.
 //! Tokens vest linearly between `cliff_ledger` and `end_ledger`.
+//!
+//! # Pause policy
+//!
+//! | Entrypoint | Pause-gated | Auth |
+//! |------------|-------------|------|
+//! | `create_vesting` | yes | governance |
+//! | `change_beneficiary` | yes | governance |
+//! | `revoke_vesting` | yes | governance |
+//! | `release` | **no** | beneficiary |
+//! | `pause` / `unpause` | n/a | governance |
+//! | every view (`get_*`, `list_*`, `*_amount`, `committed`, `is_paused`) | **no** | none |
+//!
+//! Pausing halts governance-initiated state changes while leaving
+//! beneficiaries able to withdraw already-vested tokens. This mirrors the
+//! "principal is never trapped" rule in `staking` and `incentive_campaigns`.
 
 #![no_std]
 
@@ -49,6 +64,8 @@ pub enum VestingError {
     /// `lp_token` is not an LP token administered by `pool`, or is not an LP
     /// token at all.
     LpTokenMismatch = 13,
+    /// Governance-gated mutations are blocked while the contract is paused.
+    Paused = 14,
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -75,6 +92,8 @@ pub enum DataKey {
     Treasury,
     /// Pending treasury nominee for two-step treasury rotation.
     PendingTreasury,
+    /// Contract-wide pause flag. Set by `pause`, cleared by `unpause`.
+    Paused,
     /// Next schedule id for a beneficiary.
     NextScheduleId(Address),
     /// Per-beneficiary vesting schedule keyed by beneficiary and schedule id.
@@ -149,6 +168,7 @@ impl PolVestingContract {
         Self::extend_ttl(&env);
         governance.require_auth();
         Self::require_governance(&env, &governance)?;
+
         env.deployer()
             .update_current_contract_wasm(new_wasm_hash.clone());
         soroban_amm_sdk::emit_versioned_event!(
@@ -307,6 +327,43 @@ impl PolVestingContract {
             .unwrap_or(None)
     }
 
+    /// Halt governance-gated mutations (create, change, revoke). Governance only.
+    ///
+    /// `release` and every view remain open so beneficiaries can always
+    /// withdraw vested tokens ("principal is never trapped"). Mirrors
+    /// `incentive_campaigns::pause` / `staking::pause`.
+    pub fn pause(env: Env, governance: Address) -> Result<(), VestingError> {
+        Self::extend_ttl(&env);
+        governance.require_auth();
+        Self::require_governance(&env, &governance)?;
+        env.storage().instance().set(&DataKey::Paused, &true);
+        soroban_amm_sdk::emit_versioned_event!(&env, (Symbol::new(&env, "paused"),), (governance,));
+        Ok(())
+    }
+
+    /// Resume governance-gated mutations. Governance only.
+    pub fn unpause(env: Env, governance: Address) -> Result<(), VestingError> {
+        Self::extend_ttl(&env);
+        governance.require_auth();
+        Self::require_governance(&env, &governance)?;
+        env.storage().instance().set(&DataKey::Paused, &false);
+        soroban_amm_sdk::emit_versioned_event!(
+            &env,
+            (Symbol::new(&env, "unpaused"),),
+            (governance,)
+        );
+        Ok(())
+    }
+
+    /// Return whether the contract is currently paused.
+    pub fn is_paused(env: Env) -> bool {
+        Self::extend_ttl(&env);
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
     /// Governance creates a vesting schedule for `beneficiary`.
     ///
     /// The caller must be the governance contract and must have already
@@ -329,6 +386,7 @@ impl PolVestingContract {
         Self::extend_ttl(&env);
         governance.require_auth();
         Self::require_governance(&env, &governance)?;
+        Self::require_not_paused(&env)?;
 
         if cliff_ledger < start_ledger || end_ledger <= cliff_ledger || total <= 0 {
             return Err(VestingError::InvalidSchedule);
@@ -647,6 +705,7 @@ impl PolVestingContract {
         Self::extend_ttl(&env);
         governance.require_auth();
         Self::require_governance(&env, &governance)?;
+        Self::require_not_paused(&env)?;
 
         let old_key = DataKey::Vesting(old_beneficiary.clone(), old_schedule_id);
         let mut schedule: PolVesting = env
@@ -738,6 +797,7 @@ impl PolVestingContract {
         Self::extend_ttl(&env);
         governance.require_auth();
         Self::require_governance(&env, &governance)?;
+        Self::require_not_paused(&env)?;
 
         let key = DataKey::Vesting(beneficiary.clone(), schedule_id);
         let mut schedule: PolVesting = env
@@ -867,6 +927,18 @@ impl PolVestingContract {
         let gov: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
         if gov != *caller {
             return Err(VestingError::NotGovernance);
+        }
+        Ok(())
+    }
+
+    fn require_not_paused(env: &Env) -> Result<(), VestingError> {
+        if env
+            .storage()
+            .instance()
+            .get::<DataKey, bool>(&DataKey::Paused)
+            .unwrap_or(false)
+        {
+            return Err(VestingError::Paused);
         }
         Ok(())
     }
@@ -2366,5 +2438,153 @@ mod tests {
         // Beneficiary claims the remaining 400_000, committed drops to 0
         client.release(&s.beneficiary, &id);
         assert_eq!(client.committed(&s.lp_token), 0);
+    }
+    #[test]
+    fn test_pause_requires_governance_auth() {
+        let s = setup();
+        let client = PolVestingContractClient::new(&s.env, &s.contract_id);
+        let rando = Address::generate(&s.env);
+
+        let err = client.try_pause(&rando).unwrap_err().unwrap();
+        assert_eq!(err, VestingError::NotGovernance);
+        assert!(!client.is_paused());
+    }
+
+    #[test]
+    fn test_pause_and_unpause_governance_only() {
+        let s = setup();
+        let client = PolVestingContractClient::new(&s.env, &s.contract_id);
+
+        assert!(!client.is_paused());
+        client.pause(&s.governance);
+        assert!(client.is_paused());
+        client.unpause(&s.governance);
+        assert!(!client.is_paused());
+    }
+
+    #[test]
+    fn test_pause_blocks_create_vesting() {
+        let s = setup();
+        let client = PolVestingContractClient::new(&s.env, &s.contract_id);
+        client.pause(&s.governance);
+
+        let err = client
+            .try_create_vesting(
+                &s.governance,
+                &s.beneficiary,
+                &s.lp_token,
+                &s.pool,
+                &1_000_000,
+                &0,
+                &0,
+                &1000,
+            )
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, VestingError::Paused);
+    }
+
+    #[test]
+    fn test_pause_blocks_change_beneficiary() {
+        let s = setup();
+        let client = PolVestingContractClient::new(&s.env, &s.contract_id);
+        let id = create_schedule(&s, 0, 0, 1000);
+        let new_beneficiary = Address::generate(&s.env);
+
+        client.pause(&s.governance);
+        let err = client
+            .try_change_beneficiary(&s.governance, &s.beneficiary, &id, &new_beneficiary)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, VestingError::Paused);
+    }
+
+    #[test]
+    fn test_pause_blocks_revoke_vesting() {
+        let s = setup();
+        let client = PolVestingContractClient::new(&s.env, &s.contract_id);
+        let id = create_schedule(&s, 0, 0, 1000);
+
+        client.pause(&s.governance);
+        let err = client
+            .try_revoke_vesting(&s.governance, &s.beneficiary, &id)
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, VestingError::Paused);
+    }
+
+    #[test]
+    fn test_release_still_pays_while_paused() {
+        let s = setup();
+        let client = PolVestingContractClient::new(&s.env, &s.contract_id);
+        let id = create_schedule(&s, 0, 0, 1000);
+
+        client.pause(&s.governance);
+
+        s.env.ledger().set_sequence_number(500);
+        let released = client.release(&s.beneficiary, &id);
+        assert_eq!(released, 500_000);
+
+        let lp = TokenClient::new(&s.env, &s.lp_token);
+        assert_eq!(lp.balance(&s.beneficiary), 500_000);
+    }
+
+    #[test]
+    fn test_views_still_callable_while_paused() {
+        let s = setup();
+        let client = PolVestingContractClient::new(&s.env, &s.contract_id);
+        let id = create_schedule(&s, 0, 0, 1000);
+
+        client.pause(&s.governance);
+
+        assert!(client.is_paused());
+        assert_eq!(client.get_governance(), s.governance);
+        assert_eq!(client.get_treasury(), s.treasury);
+        assert_eq!(client.committed(&s.lp_token), 1_000_000);
+        assert_eq!(client.schedule_count(&s.beneficiary), 1);
+        assert_eq!(client.list_schedules(&s.beneficiary, &0, &10).len(), 1);
+        assert_eq!(client.get_vesting(&s.beneficiary, &id).total, 1_000_000);
+    }
+
+    #[test]
+    fn test_unpause_reenables_governance_actions() {
+        let s = setup();
+        let client = PolVestingContractClient::new(&s.env, &s.contract_id);
+        client.pause(&s.governance);
+
+        let err = client
+            .try_create_vesting(
+                &s.governance,
+                &s.beneficiary,
+                &s.lp_token,
+                &s.pool,
+                &1_000_000,
+                &0,
+                &0,
+                &1000,
+            )
+            .unwrap_err()
+            .unwrap();
+        assert_eq!(err, VestingError::Paused);
+
+        client.unpause(&s.governance);
+        let id = create_schedule(&s, 0, 0, 1000);
+        assert_eq!(id, 0);
+    }
+
+    #[test]
+    fn test_pause_emits_versioned_events() {
+        let s = setup();
+        let client = PolVestingContractClient::new(&s.env, &s.contract_id);
+
+        client.pause(&s.governance);
+        let (version, data): (u32, (Address,)) = last_versioned_event(&s, "paused");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(data, (s.governance.clone(),));
+
+        client.unpause(&s.governance);
+        let (version, data): (u32, (Address,)) = last_versioned_event(&s, "unpaused");
+        assert_eq!(version, soroban_amm_sdk::EVENT_SCHEMA_VERSION);
+        assert_eq!(data, (s.governance.clone(),));
     }
 }

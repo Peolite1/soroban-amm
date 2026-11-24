@@ -268,6 +268,8 @@ a representative call sequence and asserts every pool event carries the leading
 | `released` | — | `(beneficiary: Address, schedule_id: u32, amount: i128)` |
 | `beneficiary_changed` | — | `(old_beneficiary: Address, old_schedule_id: u32, new_beneficiary: Address, new_schedule_id: u32)` |
 | `vesting_revoked` | — | `(beneficiary: Address, schedule_id: u32, to_beneficiary: i128, to_treasury: i128)` |
+| `paused` | — | `(governance: Address)` |
+| `unpaused` | — | `(governance: Address)` |
 
 ### Incentive Campaigns — `contracts/incentive_campaigns/src/lib.rs`
 
