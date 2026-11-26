@@ -30,7 +30,7 @@
 |------|-----------------|-------|---------|
 | Rust | stable ≥ 1.75 | `rustc --version` | `rustup update` |
 | WASM target | `wasm32v1-none` | `rustup target list --installed \| grep wasm32v1-none` | `rustup target add wasm32v1-none` |
-| Stellar CLI | **25.1.0** (pinned) | `stellar --version` | `cargo install --locked stellar-cli@25.1.0 --features opt` |
+| Stellar CLI | [`.stellar-version`](../.stellar-version) | `stellar --version` | `cargo install --locked stellar-cli --version "$(cat .stellar-version)"` |
 | Docker (optional) | any recent | `docker --version` | For reproducible builds: `docker compose run --rm build` |
 
 > The WASM target **must** be `wasm32v1-none`. The legacy `wasm32-unknown-unknown`
@@ -501,11 +501,12 @@ bash scripts/e2e.sh
 ```
 
 The flows live in `scripts/e2e/`. The shared flows (`v2`, `factory`, `cl`,
-`governance`, `staking`) run against the addresses `deploy.sh` persists. The
-self-contained flows (`token`, `router`, `dex_aggregator`,
-`oracle_aggregator`, `cl_position_nft`, `pol_vesting`, `twap_consumer`)
-deploy their own instances and can be run one at a time without a full
-deployment, e.g. `bash scripts/e2e/router.sh`. Select flows with
+`governance`, `staking`, `twap`) run against the addresses `deploy.sh`
+persists. The self-contained flows (`token`, `router`, `dex_aggregator`,
+`oracle_aggregator`, `cl_position_nft`, `pol_vesting`, `twap_consumer`,
+`twal_consumer`, `incentive_campaigns`) deploy their own instances and can be
+run one at a time without a full deployment, e.g.
+`bash scripts/e2e/router.sh`. Select flows with
 `--only`/`--skip` (see `bash scripts/e2e/run.sh --help`); the self-contained
 flows fund extra signers through friendbot, so they target testnet.
 

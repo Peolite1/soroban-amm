@@ -5,6 +5,11 @@
 pub mod math;
 pub mod tick_bitmap;
 
+#[cfg(test)]
+mod guard_tests;
+#[cfg(test)]
+mod tests_quote_parity;
+
 use soroban_sdk::token::Client as TokenClient;
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, Address,
@@ -22,6 +27,15 @@ const TICK_BASE_NUM: i128 = 1_000_100;
 const TICK_BASE_DEN: i128 = PRICE_SCALE;
 const MIN_TICK: i32 = -887_272;
 const MAX_TICK: i32 = 887_272;
+const MIN_BITMAP_WORD_POS: i32 = -6_932;
+const MAX_BITMAP_WORD_POS: i32 = 6_931;
+/// Bitmap words per `TickBitmapIndexPage`; the 13,864 possible words fit in
+/// 109 pages, so one `u128` root covers every page.
+const BITMAP_INDEX_PAGE_BITS: i32 = 128;
+/// Upper bound on index pages one `migrate_tick_bitmap_index` call writes,
+/// keeping each batch's ledger footprint small regardless of how widely the
+/// legacy words are spread.
+const BITMAP_INDEX_MIGRATION_MAX_PAGES: u32 = 16;
 /// Fixed-point scale of the fee-growth accumulators (Q64 wide scale, issue #1098).
 pub const FEE_GROWTH_SCALE: i128 = 1_i128 << 64;
 
@@ -76,7 +90,7 @@ pub enum ClError {
     Paused = 11,
     Unauthorized = 12,
     TickNotAligned = 13,     // tick is not a multiple of tick_spacing
-    InvalidTickSpacing = 14, // tick_spacing must be > 0
+    InvalidTickSpacing = 14, // tick_spacing must be in 1..=MAX_TICK
     TickNotInitialized = 15, // requested tick has no liquidity (never touched by a position)
     InvalidToken = 16,       // token_in is not token_a or token_b
     RangeOrderInRange = 17,  // range order must be fully out-of-range at creation
@@ -105,6 +119,9 @@ pub enum ClError {
     /// `set_oracle_cardinality` was called with zero, a value smaller than the
     /// current cardinality, or a value above `MAX_ORACLE_CARDINALITY` (#1101).
     InvalidOracleCardinality = 27,
+    /// `set_position_nft` was given an address that is not a `cl_position_nft`
+    /// contract initialized with this pool's address as its `cl_pool`.
+    NftNotWiredToPool = 28,
 }
 
 /// Status of a range order (issue #295).
@@ -172,7 +189,18 @@ pub enum DataKey {
     /// Lets the legacy address-keyed entry points detect a tokenized position
     /// and defer control to the current NFT owner.
     PositionNftToken(Address, i32, i32),
+    // Paged tick-bitmap word index (#1311). Page `p` covers bitmap words
+    // `-6932 + 128p ..= -6932 + 128p + 127`; the root has one bit per page.
+    /// `u128` presence bitmap of non-empty `TickBitmap` words in one page.
+    TickBitmapIndexPage(i32),
+    /// Instance `u128` bitmap of non-empty index pages; absent means none.
+    TickBitmapIndexRoot,
+    /// Instance flag: the paged index is authoritative.
+    TickBitmapIndexMigrated,
+    /// Legacy sorted word index, kept only until a pool is migrated.
     TickBitmapWords,
+    /// Instance cursor of an in-progress `migrate_tick_bitmap_index`.
+    TickBitmapIndexCursor,
     /// Persistent ring-buffer slot `0..cardinality` holding an [`OracleObservation`] (#1101).
     OracleObservation(u32),
     /// Instance-storage metadata ([`OracleHeader`]) for the oracle ring buffer (#1101).
@@ -219,6 +247,8 @@ pub trait PositionNftInterface {
     fn mint(env: Env, to: Address, pool: Address, lower_tick: i32, upper_tick: i32) -> u64;
     fn burn(env: Env, token_id: u64);
     fn owner_of(env: Env, token_id: u64) -> Address;
+    fn cl_pool(env: Env) -> Address;
+    fn total_supply(env: Env) -> u64;
 }
 
 #[contracttype]
@@ -326,8 +356,8 @@ impl ConcentratedLiquidity {
 
     /// One-time initialisation. Sets admin, token pair, fee, starting tick, and tick spacing.
     ///
-    /// `tick_spacing` must be > 0. Only tick values that are exact multiples of
-    /// `tick_spacing` may be used as position boundaries in `mint_position`.
+    /// `tick_spacing` must be in `1..=MAX_TICK`. Only tick values that are exact
+    /// multiples of `tick_spacing` may be used as position boundaries in `mint_position`.
     /// Suggested defaults: fee 5 bps → spacing 1, fee 30 bps → spacing 10,
     /// fee 100 bps → spacing 60.
     pub fn initialize(
@@ -352,7 +382,7 @@ impl ConcentratedLiquidity {
         if !(MIN_TICK..=MAX_TICK).contains(&initial_tick) {
             return Err(ClError::TickOutOfRange);
         }
-        if tick_spacing <= 0 {
+        if !(1..=MAX_TICK).contains(&tick_spacing) {
             return Err(ClError::InvalidTickSpacing);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
@@ -397,9 +427,13 @@ impl ConcentratedLiquidity {
             .instance()
             .set(&DataKey::MaxOracleDeviationBps, &500_i128);
         env.storage()
-            .persistent()
-            .set(&DataKey::TickBitmapWords, &Vec::<i32>::new(&env));
-        Self::bump_position(&env, &DataKey::TickBitmapWords);
+            .instance()
+            .set(&DataKey::TickBitmapIndexMigrated, &true);
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "initialized"),),
+            (admin, token_a, token_b, fee_bps, initial_tick, tick_spacing)
+        );
         Ok(())
     }
 
@@ -438,6 +472,8 @@ impl ConcentratedLiquidity {
     ///
     /// The NFT contract must be initialized with this pool's address as its
     /// `cl_pool`, otherwise mint/burn calls from the pool will be rejected.
+    /// Detaching or replacing the contract is blocked while tokenized positions
+    /// remain open.
     pub fn set_position_nft(env: Env, admin: Address, nft: Option<Address>) -> Result<(), ClError> {
         Self::extend_instance_ttl(&env);
         let stored = Self::read_admin(&env)?;
@@ -446,20 +482,40 @@ impl ConcentratedLiquidity {
         }
         admin.require_auth();
 
-        // Safety check: prevent changing NFT contract when positions are tokenized.
-        // Changing the contract would orphan existing token_id → position indices,
-        // causing resolve_token_owner/ensure_legacy_owner to query the wrong NFT
-        // and either trap (id doesn't exist) or authorize the wrong owner (id collision).
+        // Changing or detaching the NFT contract would orphan the token_id indexes.
         let existing_nft: Option<Address> = env
             .storage()
             .instance()
             .get(&DataKey::PositionNft)
             .unwrap_or(None);
+        // Detach only once the NFT contract reports no live tokens; an NFT
+        // contract that cannot answer keeps the pool attached (fail closed).
+        let tokenized_positions_remain = if nft.is_none() {
+            existing_nft.as_ref().is_some_and(|nft_addr| {
+                !matches!(
+                    PositionNftClient::new(&env, nft_addr).try_total_supply(),
+                    Ok(Ok(0))
+                )
+            })
+        } else {
+            false
+        };
 
-        // Only allow changing from Some → None (detach) or None → Some (initial set).
-        // Changing from Some(A) → Some(B) is forbidden.
-        if existing_nft.is_some() && nft.is_some() && existing_nft != nft {
+        if existing_nft.is_some()
+            && ((nft.is_some() && existing_nft != nft) || tokenized_positions_remain)
+        {
             return Err(ClError::NftContractChangeBlocked);
+        }
+
+        // Verify the candidate NFT contract is initialized and wired to this pool.
+        if let Some(ref nft_addr) = nft {
+            let wired_pool = match PositionNftClient::new(&env, nft_addr).try_cl_pool() {
+                Ok(Ok(pool)) => pool,
+                _ => return Err(ClError::NftNotWiredToPool),
+            };
+            if wired_pool != env.current_contract_address() {
+                return Err(ClError::NftNotWiredToPool);
+            }
         }
 
         env.storage().instance().set(&DataKey::PositionNft, &nft);
@@ -1226,91 +1282,13 @@ impl ConcentratedLiquidity {
         //    Dust = amount_in - amount_used (never transferred; stays with provider).
         //
 
-        let (amount_a, amount_b, liquidity, amount_used) = if current_tick < lower_tick {
-            // Case 1: price below range — only token A
-            if !is_token_a {
-                return Err(ClError::SlippageExceeded);
-            }
-            // Use proper sqrtPriceX96 formulas for accurate calculation
-            let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
-            let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
-            let liq = math::get_liquidity_for_amount0(sqrt_lower, sqrt_upper, amount_in)
-                .ok_or(ClError::MathOverflow)?;
-            (amount_in, 0_i128, liq.max(1), amount_in)
-        } else if current_tick >= upper_tick {
-            // Case 2: price above range — only token B
-            if is_token_a {
-                return Err(ClError::SlippageExceeded);
-            }
-            // Use proper sqrtPriceX96 formulas for accurate calculation
-            let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
-            let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
-            let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_upper, amount_in)
-                .ok_or(ClError::MathOverflow)?;
-            (0_i128, amount_in, liq.max(1), amount_in)
-        } else {
-            // Case 3: price in range — compute liquidity from the single token's half
-            // Using proper Uniswap V3 formulas with sqrtPriceX96
-            let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
-            let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
-            let sqrt_current = Self::tick_to_sqrt_price_x96(current_tick);
-
-            if sqrt_current >= sqrt_upper {
-                // Degenerate: current at or above upper tick
-                if is_token_a {
-                    let liq = math::get_liquidity_for_amount0(sqrt_current, sqrt_upper, amount_in)
-                        .ok_or(ClError::MathOverflow)?;
-                    let liq = liq.max(1);
-                    let used = math::get_amount0_delta(sqrt_current, sqrt_upper, liq)
-                        .ok_or(ClError::MathOverflow)?;
-                    (used, 0_i128, liq, used)
-                } else {
-                    let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_current, amount_in)
-                        .ok_or(ClError::MathOverflow)?;
-                    let liq = liq.max(1);
-                    let used = math::get_amount1_delta(sqrt_lower, sqrt_current, liq)
-                        .ok_or(ClError::MathOverflow)?;
-                    (0_i128, used, liq, used)
-                }
-            } else if sqrt_current <= sqrt_lower {
-                // Degenerate: current at or below lower tick
-                if is_token_a {
-                    let liq = math::get_liquidity_for_amount0(sqrt_current, sqrt_upper, amount_in)
-                        .ok_or(ClError::MathOverflow)?;
-                    let liq = liq.max(1);
-                    let used = math::get_amount0_delta(sqrt_current, sqrt_upper, liq)
-                        .ok_or(ClError::MathOverflow)?;
-                    (used, 0_i128, liq, used)
-                } else {
-                    let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_current, amount_in)
-                        .ok_or(ClError::MathOverflow)?;
-                    let liq = liq.max(1);
-                    let used = math::get_amount1_delta(sqrt_lower, sqrt_current, liq)
-                        .ok_or(ClError::MathOverflow)?;
-                    (0_i128, used, liq, used)
-                }
-            } else if is_token_a {
-                // Token A covers [current_price, upper_price].
-                // Liquidity is computed from the amount, then we back-compute actual token amount.
-                let liq = math::get_liquidity_for_amount0(sqrt_current, sqrt_upper, amount_in)
-                    .ok_or(ClError::MathOverflow)?;
-                let liq = liq.max(1);
-                let used = math::get_amount0_delta(sqrt_current, sqrt_upper, liq)
-                    .ok_or(ClError::MathOverflow)?;
-                (used, 0_i128, liq, used)
-            } else {
-                // Token B covers [lower_price, current_price].
-                let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_current, amount_in)
-                    .ok_or(ClError::MathOverflow)?;
-                let liq = liq.max(1);
-                let used = math::get_amount1_delta(sqrt_lower, sqrt_current, liq)
-                    .ok_or(ClError::MathOverflow)?;
-                (0_i128, used, liq, used)
-            }
-        };
-        if liquidity <= 0 {
-            return Err(ClError::ZeroLiquidity);
-        }
+        let (amount_a, amount_b, liquidity, amount_used) = Self::compute_single_token_deposit(
+            current_tick,
+            lower_tick,
+            upper_tick,
+            is_token_a,
+            amount_in,
+        )?;
         if liquidity < min_liquidity {
             return Err(ClError::SlippageExceeded);
         }
@@ -1417,6 +1395,67 @@ impl ConcentratedLiquidity {
         })
     }
 
+    /// Shared amount/liquidity calculation for `mint_position_single_token` and
+    /// `quote_single_token_deposit`.
+    ///
+    /// Returns `(amount_a, amount_b, liquidity, amount_used)`.
+    fn compute_single_token_deposit(
+        current_tick: i32,
+        lower_tick: i32,
+        upper_tick: i32,
+        is_token_a: bool,
+        amount_in: i128,
+    ) -> Result<(i128, i128, i128, i128), ClError> {
+        let (amount_a, amount_b, liquidity, amount_used) = if current_tick < lower_tick {
+            // Case 1: price below range — only token A
+            if !is_token_a {
+                return Err(ClError::SlippageExceeded);
+            }
+            let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
+            let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
+            let liq = math::get_liquidity_for_amount0(sqrt_lower, sqrt_upper, amount_in)
+                .ok_or(ClError::MathOverflow)?;
+            (amount_in, 0_i128, liq.max(1), amount_in)
+        } else if current_tick >= upper_tick {
+            // Case 2: price above range — only token B
+            if is_token_a {
+                return Err(ClError::SlippageExceeded);
+            }
+            let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
+            let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
+            let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_upper, amount_in)
+                .ok_or(ClError::MathOverflow)?;
+            (0_i128, amount_in, liq.max(1), amount_in)
+        } else {
+            // Case 3: price in range — compute liquidity from the single token's half
+            let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
+            let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
+            let sqrt_current = Self::tick_to_sqrt_price_x96(current_tick);
+
+            if is_token_a {
+                let liq = math::get_liquidity_for_amount0(sqrt_current, sqrt_upper, amount_in)
+                    .ok_or(ClError::MathOverflow)?;
+                let liq = liq.max(1);
+                let used = math::get_amount0_delta(sqrt_current, sqrt_upper, liq)
+                    .ok_or(ClError::MathOverflow)?;
+                (used, 0_i128, liq, used)
+            } else {
+                let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_current, amount_in)
+                    .ok_or(ClError::MathOverflow)?;
+                let liq = liq.max(1);
+                let used = math::get_amount1_delta(sqrt_lower, sqrt_current, liq)
+                    .ok_or(ClError::MathOverflow)?;
+                (0_i128, used, liq, used)
+            }
+        };
+
+        if liquidity <= 0 || (amount_a <= 0 && amount_b <= 0) {
+            return Err(ClError::ZeroLiquidity);
+        }
+
+        Ok((amount_a, amount_b, liquidity, amount_used))
+    }
+
     /// Quote the expected result of a single-token deposit without executing it.
     ///
     /// Pure read — does not transfer tokens or modify state.
@@ -1436,6 +1475,14 @@ impl ConcentratedLiquidity {
         if lower_tick < MIN_TICK || upper_tick > MAX_TICK {
             return Err(ClError::TickOutOfRange);
         }
+        let tick_spacing: i32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TickSpacing)
+            .unwrap_or(1);
+        if lower_tick % tick_spacing != 0 || upper_tick % tick_spacing != 0 {
+            return Err(ClError::TickNotAligned);
+        }
         if amount_in <= 0 {
             return Err(ClError::ZeroAmounts);
         }
@@ -1447,55 +1494,13 @@ impl ConcentratedLiquidity {
         }
 
         let current_tick = Self::read_current_tick(&env)?;
-
-        // Mirror the exact same logic as mint_position_single_token.
-        let (liquidity, amount_used) = if current_tick < lower_tick {
-            if !is_token_a {
-                return Err(ClError::SlippageExceeded);
-            }
-            let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
-            let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
-            let liq = math::get_liquidity_for_amount0(sqrt_lower, sqrt_upper, amount_in)
-                .ok_or(ClError::MathOverflow)?;
-            (liq.max(1), amount_in)
-        } else if current_tick >= upper_tick {
-            if is_token_a {
-                return Err(ClError::SlippageExceeded);
-            }
-            let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
-            let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
-            let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_upper, amount_in)
-                .ok_or(ClError::MathOverflow)?;
-            (liq.max(1), amount_in)
-        } else {
-            let sqrt_lower = Self::tick_to_sqrt_price_x96(lower_tick);
-            let sqrt_upper = Self::tick_to_sqrt_price_x96(upper_tick);
-            let sqrt_current = Self::tick_to_sqrt_price_x96(current_tick);
-
-            if sqrt_current >= sqrt_upper {
-                let liq = math::get_liquidity_for_amount0(sqrt_upper, sqrt_upper, amount_in)
-                    .ok_or(ClError::MathOverflow)?;
-                (liq.max(1), amount_in)
-            } else if sqrt_current <= sqrt_lower {
-                let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_lower, amount_in)
-                    .ok_or(ClError::MathOverflow)?;
-                (liq.max(1), amount_in)
-            } else if is_token_a {
-                let liq = math::get_liquidity_for_amount0(sqrt_current, sqrt_upper, amount_in)
-                    .ok_or(ClError::MathOverflow)?;
-                let liq = liq.max(1);
-                let used = math::get_amount0_delta(sqrt_current, sqrt_upper, liq)
-                    .ok_or(ClError::MathOverflow)?;
-                (liq, used)
-            } else {
-                let liq = math::get_liquidity_for_amount1(sqrt_lower, sqrt_current, amount_in)
-                    .ok_or(ClError::MathOverflow)?;
-                let liq = liq.max(1);
-                let used = math::get_amount1_delta(sqrt_lower, sqrt_current, liq)
-                    .ok_or(ClError::MathOverflow)?;
-                (liq, used)
-            }
-        };
+        let (_amount_a, _amount_b, liquidity, amount_used) = Self::compute_single_token_deposit(
+            current_tick,
+            lower_tick,
+            upper_tick,
+            is_token_a,
+            amount_in,
+        )?;
 
         Ok(SingleTokenDepositResult {
             amount_used,
@@ -2205,6 +2210,81 @@ impl ConcentratedLiquidity {
         Self::next_initialized_tick(&env, tick, true)
     }
 
+    /// Migrate up to `max_words` words of a legacy `TickBitmapWords` index into
+    /// the paged index (#1311); call until it returns 0 (the words left).
+    /// Permissionless. Pools created by this version never need it.
+    //
+    // Until migration finishes, an upgraded pool keeps using and maintaining
+    // the legacy vector. Each batch copies words in ascending order, writes
+    // each touched page once and stops after BITMAP_INDEX_MIGRATION_MAX_PAGES
+    // pages, then stores the next word in TickBitmapIndexCursor. Words added
+    // or removed below the cursor between batches are mirrored into the paged
+    // index by set_bitmap_word_index. The final batch deletes the vector.
+    pub fn migrate_tick_bitmap_index(env: Env, max_words: u32) -> Result<u32, ClError> {
+        Self::extend_instance_ttl(&env);
+        Self::read_admin(&env)?;
+        if Self::bitmap_index_migrated(&env) {
+            return Ok(0);
+        }
+
+        let words = Self::read_legacy_bitmap_words(&env).unwrap_or_else(|| Vec::new(&env));
+        let len = words.len();
+        let cursor = Self::bitmap_index_migration_cursor(&env);
+        let mut idx = Self::legacy_bitmap_lower_bound(&words, cursor, false);
+
+        let root_before = Self::read_bitmap_index_root(&env);
+        let mut root = root_before;
+        let mut page: Option<i32> = None;
+        let mut page_bits = 0_u128;
+        let mut pages_written = 0_u32;
+        let mut processed = 0_u32;
+        while idx < len && processed < max_words {
+            let word_pos = words.get_unchecked(idx);
+            if let Some(offset) = Self::bitmap_word_offset(word_pos) {
+                let word_page = offset / BITMAP_INDEX_PAGE_BITS;
+                if page != Some(word_page) {
+                    // Words are sorted, so each page is visited in one run and
+                    // written exactly once per batch.
+                    if let Some(done) = page.take() {
+                        Self::write_bitmap_index_page(&env, done, page_bits);
+                        root |= 1_u128 << done;
+                        pages_written += 1;
+                        if pages_written >= BITMAP_INDEX_MIGRATION_MAX_PAGES {
+                            break;
+                        }
+                    }
+                    page = Some(word_page);
+                    page_bits = Self::read_bitmap_index_page(&env, word_page);
+                }
+                page_bits |= 1_u128 << (offset % BITMAP_INDEX_PAGE_BITS);
+            }
+            idx += 1;
+            processed += 1;
+        }
+        if let Some(done) = page {
+            Self::write_bitmap_index_page(&env, done, page_bits);
+            root |= 1_u128 << done;
+        }
+        if root != root_before {
+            Self::write_bitmap_index_root(&env, root);
+        }
+
+        if idx >= len {
+            env.storage().persistent().remove(&DataKey::TickBitmapWords);
+            env.storage()
+                .instance()
+                .remove(&DataKey::TickBitmapIndexCursor);
+            env.storage()
+                .instance()
+                .set(&DataKey::TickBitmapIndexMigrated, &true);
+            return Ok(0);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::TickBitmapIndexCursor, &words.get_unchecked(idx));
+        Ok(len - idx)
+    }
+
     // ── Issue #219 / #1099: sqrtPrice math library ────────────────────────────
 
     /// Converts a tick to `sqrtPriceX96 = sqrt(1.0001^tick) * 2^96`.
@@ -2381,6 +2461,18 @@ impl ConcentratedLiquidity {
                 sqrt_price_limit_x96,
                 zero_for_one,
             );
+
+            if target_price_x96 == sqrt_price_x96
+                && !Self::can_cross_at_current_price(
+                    next_tick_opt,
+                    current_tick,
+                    sqrt_price_x96,
+                    zero_for_one,
+                    hit_limit,
+                )
+            {
+                break;
+            }
 
             let amount_in_after_fee = amount_remaining * (10000 - fee_bps) / 10000;
 
@@ -2870,6 +2962,18 @@ impl ConcentratedLiquidity {
                 sqrt_price_limit_x96,
                 zero_for_one,
             );
+
+            if target_price_x96 == sqrt_price_x96
+                && !Self::can_cross_at_current_price(
+                    next_tick_opt,
+                    current_tick,
+                    sqrt_price_x96,
+                    zero_for_one,
+                    hit_limit,
+                )
+            {
+                break;
+            }
 
             let (amount_in_step_after_fee, amount_out_step) = if active_liquidity == 0 {
                 (0, 0)
@@ -3478,7 +3582,8 @@ impl ConcentratedLiquidity {
             return Err(ClError::InvalidOracleCardinality);
         }
 
-        if new_cardinality > header.cardinality {
+        let old_cardinality = header.cardinality;
+        if new_cardinality > old_cardinality {
             // If the ring buffer had wrapped around under the old cardinality,
             // normalize the existing `count` observations into contiguous slots
             // `0..count` in chronological order so the invariant (`count < cardinality`
@@ -3514,6 +3619,11 @@ impl ConcentratedLiquidity {
                 .set(&DataKey::OracleHeader, &header);
         }
 
+        soroban_amm_sdk::emit_versioned_event!(
+            env,
+            (Symbol::new(&env, "oracle_cardinality_set"),),
+            (old_cardinality, new_cardinality)
+        );
         Ok(())
     }
 
@@ -3862,6 +3972,15 @@ impl ConcentratedLiquidity {
         if lower_tick < MIN_TICK || upper_tick > MAX_TICK {
             return Err(ClError::TickOutOfRange);
         }
+        // Enforce tick spacing: ticks must be multiples of tick_spacing.
+        let tick_spacing: i32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::TickSpacing)
+            .unwrap_or(1);
+        if lower_tick % tick_spacing != 0 || upper_tick % tick_spacing != 0 {
+            return Err(ClError::TickNotAligned);
+        }
         if liquidity <= 0 {
             return Err(ClError::ZeroLiquidity);
         }
@@ -4087,59 +4206,167 @@ impl ConcentratedLiquidity {
         }
     }
 
-    fn add_bitmap_word_index(env: &Env, word_pos: i32) {
-        let mut words: Vec<i32> = env
-            .storage()
-            .persistent()
-            .get(&DataKey::TickBitmapWords)
-            .unwrap_or_else(|| Vec::new(env));
+    /// `true` once the paged index is authoritative. Pools initialized by this
+    /// version set the flag in `initialize`; pools upgraded from the sorted
+    /// `TickBitmapWords` index keep using it until `migrate_tick_bitmap_index`
+    /// has copied every legacy word into the paged index.
+    fn bitmap_index_migrated(env: &Env) -> bool {
+        env.storage()
+            .instance()
+            .get::<_, bool>(&DataKey::TickBitmapIndexMigrated)
+            .unwrap_or(false)
+    }
+
+    /// Legacy words strictly below this position are already in the paged
+    /// index. Absent means the migration has not started.
+    fn bitmap_index_migration_cursor(env: &Env) -> i32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TickBitmapIndexCursor)
+            .unwrap_or(MIN_BITMAP_WORD_POS)
+    }
+
+    fn read_legacy_bitmap_words(env: &Env) -> Option<Vec<i32>> {
+        let words: Option<Vec<i32>> = env.storage().persistent().get(&DataKey::TickBitmapWords);
+        if words.is_some() {
+            Self::bump_position(env, &DataKey::TickBitmapWords);
+        }
+        words
+    }
+
+    /// Index of the first element of the sorted `words` that is `>= word_pos`
+    /// (or `> word_pos` when `strict`).
+    fn legacy_bitmap_lower_bound(words: &Vec<i32>, word_pos: i32, strict: bool) -> u32 {
         let mut low = 0u32;
         let mut high = words.len();
         while low < high {
             let mid = low + (high - low) / 2;
-            let val = words.get(mid).unwrap();
-            if val == word_pos {
-                return;
-            } else if val < word_pos {
+            let val = words.get_unchecked(mid);
+            if val < word_pos || (strict && val == word_pos) {
                 low = mid + 1;
             } else {
                 high = mid;
             }
         }
-        words.insert(low, word_pos);
+        low
+    }
+
+    /// Keeps the legacy sorted index in sync while a pool has not finished
+    /// migrating, exactly as the pre-paged implementation did.
+    fn update_legacy_bitmap_words(env: &Env, word_pos: i32, present: bool) {
+        let mut words = Self::read_legacy_bitmap_words(env).unwrap_or_else(|| Vec::new(env));
+        let idx = Self::legacy_bitmap_lower_bound(&words, word_pos, false);
+        let found = idx < words.len() && words.get_unchecked(idx) == word_pos;
+        if present == found {
+            return;
+        }
+        if present {
+            words.insert(idx, word_pos);
+        } else {
+            words.remove(idx);
+        }
         env.storage()
             .persistent()
             .set(&DataKey::TickBitmapWords, &words);
         Self::bump_position(env, &DataKey::TickBitmapWords);
     }
 
-    fn remove_bitmap_word_index(env: &Env, word_pos: i32) {
-        let mut words: Vec<i32> = match env.storage().persistent().get(&DataKey::TickBitmapWords) {
-            Some(w) => w,
-            None => return,
+    fn bitmap_word_offset(word_pos: i32) -> Option<i32> {
+        if !(MIN_BITMAP_WORD_POS..=MAX_BITMAP_WORD_POS).contains(&word_pos) {
+            return None;
+        }
+        Some(word_pos - MIN_BITMAP_WORD_POS)
+    }
+
+    fn read_bitmap_index_page(env: &Env, page: i32) -> u128 {
+        let key = DataKey::TickBitmapIndexPage(page);
+        if let Some(bits) = env.storage().persistent().get(&key) {
+            Self::bump_position(env, &key);
+            bits
+        } else {
+            0
+        }
+    }
+
+    /// The root is rewritten on every empty <-> non-empty page transition and
+    /// removed when no page is populated, so a missing root means "no pages"
+    /// and never needs reconstructing from the pages. It is a fixed-size
+    /// `u128` in instance storage, so reading it adds no ledger entry to the
+    /// footprint and needs no TTL bump of its own.
+    fn read_bitmap_index_root(env: &Env) -> u128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::TickBitmapIndexRoot)
+            .unwrap_or(0)
+    }
+
+    fn write_bitmap_index_page(env: &Env, page: i32, bits: u128) {
+        let key = DataKey::TickBitmapIndexPage(page);
+        if bits == 0 {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &bits);
+            Self::bump_position(env, &key);
+        }
+    }
+
+    fn write_bitmap_index_root(env: &Env, bits: u128) {
+        let key = DataKey::TickBitmapIndexRoot;
+        if bits == 0 {
+            env.storage().instance().remove(&key);
+        } else {
+            env.storage().instance().set(&key, &bits);
+        }
+    }
+
+    fn update_bitmap_word_index(env: &Env, word_pos: i32, present: bool) {
+        let Some(offset) = Self::bitmap_word_offset(word_pos) else {
+            return;
         };
-        let mut low = 0u32;
-        let mut high = words.len();
-        let mut found = None;
-        while low < high {
-            let mid = low + (high - low) / 2;
-            let val = words.get(mid).unwrap();
-            if val == word_pos {
-                found = Some(mid);
-                break;
-            } else if val < word_pos {
-                low = mid + 1;
+        let page = offset / BITMAP_INDEX_PAGE_BITS;
+        let bit = 1u128 << (offset % BITMAP_INDEX_PAGE_BITS);
+        let page_before = Self::read_bitmap_index_page(env, page);
+        let page_after = if present {
+            page_before | bit
+        } else {
+            page_before & !bit
+        };
+        if page_before == page_after {
+            return;
+        }
+
+        Self::write_bitmap_index_page(env, page, page_after);
+        if page_before == 0 || page_after == 0 {
+            let root_before = Self::read_bitmap_index_root(env);
+            let root_bit = 1u128 << page;
+            let root_after = if page_after == 0 {
+                root_before & !root_bit
             } else {
-                high = mid;
+                root_before | root_bit
+            };
+            Self::write_bitmap_index_root(env, root_after);
+        }
+    }
+
+    fn set_bitmap_word_index(env: &Env, word_pos: i32, present: bool) {
+        if !Self::bitmap_index_migrated(env) {
+            Self::update_legacy_bitmap_words(env, word_pos, present);
+            // Words at or above the cursor are copied from the legacy index
+            // by a later migration batch; only already-migrated words need
+            // mirroring into the paged index.
+            if word_pos >= Self::bitmap_index_migration_cursor(env) {
+                return;
             }
         }
-        if let Some(idx) = found {
-            words.remove(idx);
-            env.storage()
-                .persistent()
-                .set(&DataKey::TickBitmapWords, &words);
-            Self::bump_position(env, &DataKey::TickBitmapWords);
-        }
+        Self::update_bitmap_word_index(env, word_pos, present);
+    }
+
+    fn add_bitmap_word_index(env: &Env, word_pos: i32) {
+        Self::set_bitmap_word_index(env, word_pos, true);
+    }
+
+    fn remove_bitmap_word_index(env: &Env, word_pos: i32) {
+        Self::set_bitmap_word_index(env, word_pos, false);
     }
 
     fn flip_tick(env: &Env, tick: i32) {
@@ -4150,85 +4377,93 @@ impl ConcentratedLiquidity {
         Self::set_bitmap_word(env, word_pos, new_word);
     }
 
+    /// `zero_for_one`: the highest initialized tick at or below `tick`;
+    /// otherwise the lowest initialized tick strictly above it.
     fn next_initialized_tick(env: &Env, tick: i32, zero_for_one: bool) -> Option<i32> {
-        let words_opt: Option<Vec<i32>> = env.storage().persistent().get(&DataKey::TickBitmapWords);
-        if words_opt.is_some() {
-            Self::bump_position(env, &DataKey::TickBitmapWords);
-        }
-
-        if zero_for_one {
-            let word_pos = tick.div_euclid(128);
-            let bit_pos = tick.rem_euclid(128) as u32;
-            let word = Self::get_bitmap_word(env, word_pos);
-            let mask = if bit_pos == 127 {
-                u128::MAX
-            } else {
-                (1u128 << (bit_pos + 1)) - 1
-            };
-            let masked = word & mask;
-            if masked != 0 {
-                let bit = 127 - masked.leading_zeros();
-                return Some(word_pos * 128 + bit as i32);
-            }
-
-            // O(1)-O(log N) jump using indexed words in persistent storage
-            if let Some(ref words) = words_opt {
-                let mut low = 0u32;
-                let mut high = words.len();
-                while low < high {
-                    let mid = low + (high - low) / 2;
-                    let val = words.get(mid).unwrap();
-                    if val < word_pos {
-                        low = mid + 1;
-                    } else {
-                        high = mid;
-                    }
-                }
-                if low > 0 {
-                    let next_word_pos = words.get(low - 1).unwrap();
-                    let next_word = Self::get_bitmap_word(env, next_word_pos);
-                    if next_word != 0 {
-                        let bit = 127 - next_word.leading_zeros();
-                        return Some(next_word_pos * 128 + bit as i32);
-                    }
-                }
-            }
-            None
+        // Search the word holding the start tick, from just past the start
+        // bit, then jump to the nearest non-empty word through the index.
+        let (start, pos_offset) = if zero_for_one {
+            (tick, 1)
         } else {
-            let start_tick = tick + 1;
-            let word_pos = start_tick.div_euclid(128);
-            let bit_pos = start_tick.rem_euclid(128) as u32;
-            let word = Self::get_bitmap_word(env, word_pos);
-            let mask = u128::MAX.wrapping_shl(bit_pos);
-            let masked = word & mask;
-            if masked != 0 {
-                let bit = masked.trailing_zeros();
-                return Some(word_pos * 128 + bit as i32);
-            }
-
-            if let Some(ref words) = words_opt {
-                let mut low = 0u32;
-                let mut high = words.len();
-                while low < high {
-                    let mid = low + (high - low) / 2;
-                    let val = words.get(mid).unwrap();
-                    if val <= word_pos {
-                        low = mid + 1;
-                    } else {
-                        high = mid;
-                    }
-                }
-                if low < words.len() {
-                    let next_word_pos = words.get(low).unwrap();
-                    let next_word = Self::get_bitmap_word(env, next_word_pos);
-                    if next_word != 0 {
-                        let bit = next_word.trailing_zeros();
-                        return Some(next_word_pos * 128 + bit as i32);
-                    }
-                }
-            }
-            None
+            (tick + 1, -1)
+        };
+        let word_pos = start.div_euclid(128);
+        let pos = start.rem_euclid(128) + pos_offset;
+        if let Some(bit) =
+            Self::nearest_set_bit(Self::get_bitmap_word(env, word_pos), pos, zero_for_one)
+        {
+            return Some(word_pos * 128 + bit);
         }
+
+        let next_word_pos = Self::next_indexed_word(env, word_pos, zero_for_one)?;
+        let whole_word = if zero_for_one { 128 } else { -1 };
+        let bit = Self::nearest_set_bit(
+            Self::get_bitmap_word(env, next_word_pos),
+            whole_word,
+            zero_for_one,
+        )?;
+        Some(next_word_pos * 128 + bit)
+    }
+
+    /// Nearest indexed (non-empty) bitmap word strictly below (`previous`) or
+    /// strictly above `word_pos`, from whichever index is authoritative.
+    fn next_indexed_word(env: &Env, word_pos: i32, previous: bool) -> Option<i32> {
+        if Self::bitmap_index_migrated(env) {
+            return Self::next_bitmap_word_index(env, word_pos, previous);
+        }
+        let words = Self::read_legacy_bitmap_words(env)?;
+        if previous {
+            let idx = Self::legacy_bitmap_lower_bound(&words, word_pos, false);
+            if idx == 0 {
+                None
+            } else {
+                Some(words.get_unchecked(idx - 1))
+            }
+        } else {
+            let idx = Self::legacy_bitmap_lower_bound(&words, word_pos, true);
+            if idx < words.len() {
+                Some(words.get_unchecked(idx))
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Position of the nearest set bit of `bits` strictly below (`previous`)
+    /// or strictly above `pos`. `pos` may be 128 or -1 to search the whole word.
+    fn nearest_set_bit(bits: u128, pos: i32, previous: bool) -> Option<i32> {
+        let masked = if previous {
+            bits & u128::MAX.checked_shr(128 - pos as u32).unwrap_or(0)
+        } else {
+            bits & u128::MAX.checked_shl((pos + 1) as u32).unwrap_or(0)
+        };
+        if masked == 0 {
+            None
+        } else if previous {
+            Some(127 - masked.leading_zeros() as i32)
+        } else {
+            Some(masked.trailing_zeros() as i32)
+        }
+    }
+
+    fn next_bitmap_word_index(env: &Env, word_pos: i32, previous: bool) -> Option<i32> {
+        let offset = Self::bitmap_word_offset(word_pos)?;
+        let mut page = offset / BITMAP_INDEX_PAGE_BITS;
+        let mut bit = Self::nearest_set_bit(
+            Self::read_bitmap_index_page(env, page),
+            offset % BITMAP_INDEX_PAGE_BITS,
+            previous,
+        );
+        if bit.is_none() {
+            page = Self::nearest_set_bit(Self::read_bitmap_index_root(env), page, previous)?;
+            let whole_page = if previous { BITMAP_INDEX_PAGE_BITS } else { -1 };
+            bit = Self::nearest_set_bit(
+                Self::read_bitmap_index_page(env, page),
+                whole_page,
+                previous,
+            );
+        }
+        Some(MIN_BITMAP_WORD_POS + page * BITMAP_INDEX_PAGE_BITS + bit?)
     }
 
     fn get_tick(env: &Env, tick: i32) -> TickInfo {
@@ -4259,6 +4494,28 @@ impl ConcentratedLiquidity {
             Self::bump_position(env, &key);
             env.storage().instance().remove(&key);
         }
+    }
+
+    // At a real initialized boundary, price is already at the tick but
+    // liquidity still belongs to the side we started on. Cross the boundary
+    // once without exchanging tokens; the next lookup starts on the other
+    // side. A limit, terminal sentinel, or saturated price is not a crossing.
+    fn can_cross_at_current_price(
+        next_tick: Option<i32>,
+        current_tick: i32,
+        sqrt_price_x96: u128,
+        zero_for_one: bool,
+        hit_limit: bool,
+    ) -> bool {
+        !hit_limit
+            && sqrt_price_x96 > math::MIN_SQRT_PRICE
+            && sqrt_price_x96 < math::MAX_SQRT_PRICE
+            && next_tick
+                == Some(if zero_for_one {
+                    current_tick
+                } else {
+                    current_tick + 1
+                })
     }
 
     fn step_target_price_and_limit(
@@ -4426,6 +4683,18 @@ impl ConcentratedLiquidity {
                 sqrt_price_limit_x96,
                 zero_for_one,
             );
+
+            if target_price_x96 == sqrt_price_x96
+                && !Self::can_cross_at_current_price(
+                    next_tick_opt,
+                    current_tick,
+                    sqrt_price_x96,
+                    zero_for_one,
+                    hit_limit,
+                )
+            {
+                break;
+            }
 
             let amount_in_after_fee = amount_remaining * (10000 - fee_bps) / 10000;
 
@@ -6746,6 +7015,75 @@ mod test_tick_spacing {
         assert_eq!(result, Err(Ok(ClError::InvalidTickSpacing)));
     }
 
+    /// A spacing above the tick domain cannot produce a valid position range.
+    #[test]
+    fn test_tick_spacing_above_max_tick_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        env.budget().reset_unlimited();
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+
+        let result = client.try_initialize(
+            &admin,
+            &token_a,
+            &token_b,
+            &30_i128,
+            &0_i32,
+            &(MAX_TICK + 1),
+        );
+        assert_eq!(result, Err(Ok(ClError::InvalidTickSpacing)));
+    }
+
+    /// The largest i32 spacing must also be rejected without overflow.
+    #[test]
+    fn test_i32_max_tick_spacing_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        env.budget().reset_unlimited();
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+
+        let result = client.try_initialize(&admin, &token_a, &token_b, &30_i128, &0_i32, &i32::MAX);
+        assert_eq!(result, Err(Ok(ClError::InvalidTickSpacing)));
+    }
+
+    /// MAX_TICK is a valid spacing and its two boundary ticks can be minted.
+    #[test]
+    fn test_max_tick_spacing_allows_mint() {
+        let env = Env::default();
+        let (provider, _ta, _tb, client) = setup_cl(&env, MAX_TICK);
+
+        let result = client.try_mint_position(
+            &provider,
+            &-MAX_TICK,
+            &MAX_TICK,
+            &100_000_i128,
+            &100_000_i128,
+            &0_i128,
+            &0_i128,
+            &u64::MAX,
+        );
+        assert!(
+            result.is_ok(),
+            "MAX_TICK spacing must permit the full-domain range"
+        );
+    }
+
     /// get_pool_state must include tick_spacing set at initialize time.
     #[test]
     fn test_get_pool_state_returns_tick_spacing() {
@@ -6757,6 +7095,40 @@ mod test_tick_spacing {
             state.tick_spacing, 60,
             "get_pool_state must return tick_spacing = 60"
         );
+    }
+
+    /// quote_position must reject a misaligned lower tick with TickNotAligned.
+    #[test]
+    fn test_quote_position_misaligned_lower_tick_rejected() {
+        let env = Env::default();
+        let (_provider, _ta, _tb, client) = setup_cl(&env, 10);
+
+        let result = client.try_quote_position(&-7_i32, &10_i32, &10_000_i128);
+        assert_eq!(result, Err(Ok(ClError::TickNotAligned)));
+    }
+
+    /// quote_position must reject a misaligned upper tick with TickNotAligned.
+    #[test]
+    fn test_quote_position_misaligned_upper_tick_rejected() {
+        let env = Env::default();
+        let (_provider, _ta, _tb, client) = setup_cl(&env, 10);
+
+        let result = client.try_quote_position(&-10_i32, &7_i32, &10_000_i128);
+        assert_eq!(result, Err(Ok(ClError::TickNotAligned)));
+    }
+
+    /// quote_position with aligned ticks on a spacing-10 pool must succeed and return
+    /// the exact same amounts as on a spacing-1 pool.
+    #[test]
+    fn test_quote_position_aligned_ticks_unchanged() {
+        let env = Env::default();
+        let (_provider1, _ta1, _tb1, client_spacing_1) = setup_cl(&env, 1);
+        let (_provider10, _ta10, _tb10, client_spacing_10) = setup_cl(&env, 10);
+
+        let expected = client_spacing_1.quote_position(&-100_i32, &100_i32, &10_000_i128);
+        let actual = client_spacing_10.quote_position(&-100_i32, &100_i32, &10_000_i128);
+        assert_eq!(actual, expected);
+        assert!(actual.0 > 0 && actual.1 > 0);
     }
 
     /// tick_spacing = 1 allows every tick (no restriction).
@@ -8340,6 +8712,8 @@ mod test_single_token_deposit {
     struct NftFixture<'a> {
         client: ConcentratedLiquidityClient<'a>,
         nft: ClPositionNftClient<'a>,
+        nft_addr: Address,
+        admin: Address,
         token_a: Address,
         token_b: Address,
         alice: Address,
@@ -8392,6 +8766,8 @@ mod test_single_token_deposit {
         NftFixture {
             client,
             nft,
+            nft_addr,
+            admin,
             token_a,
             token_b,
             alice,
@@ -8415,6 +8791,134 @@ mod test_single_token_deposit {
         assert_eq!(
             f.client.position_of_token(&0_u64),
             Some((f.alice.clone(), f.lower, f.upper))
+        );
+    }
+
+    #[test]
+    fn set_position_nft_rejects_uninitialized_nft() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+        client.initialize(&admin, &token_a, &token_b, &30_i128, &0_i32, &1_i32);
+
+        let uninit_nft = env.register_contract(None, ClPositionNft);
+        assert_eq!(
+            client.try_set_position_nft(&admin, &Some(uninit_nft)),
+            Err(Ok(ClError::NftNotWiredToPool))
+        );
+        assert_eq!(client.position_nft(), None);
+    }
+
+    #[test]
+    fn set_position_nft_rejects_nft_wired_to_other_pool() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+        client.initialize(&admin, &token_a, &token_b, &30_i128, &0_i32, &1_i32);
+
+        let other_pool = Address::generate(&env);
+        let nft_addr = env.register_contract(None, ClPositionNft);
+        let nft = ClPositionNftClient::new(&env, &nft_addr);
+        nft.initialize(&admin, &other_pool);
+
+        assert_eq!(
+            client.try_set_position_nft(&admin, &Some(nft_addr)),
+            Err(Ok(ClError::NftNotWiredToPool))
+        );
+        assert_eq!(client.position_nft(), None);
+    }
+
+    #[test]
+    fn set_position_nft_rejects_non_contract_address() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+        client.initialize(&admin, &token_a, &token_b, &30_i128, &0_i32, &1_i32);
+
+        let non_contract = Address::generate(&env);
+        assert_eq!(
+            client.try_set_position_nft(&admin, &Some(non_contract)),
+            Err(Ok(ClError::NftNotWiredToPool))
+        );
+        assert_eq!(client.position_nft(), None);
+    }
+
+    #[test]
+    fn set_position_nft_accepts_wired_nft_and_mints_token() {
+        let env = Env::default();
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let alice = Address::generate(&env);
+        let token_a = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        let token_b = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+
+        let cl_addr = env.register_contract(None, ConcentratedLiquidity);
+        let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
+        client.initialize(&admin, &token_a, &token_b, &30_i128, &0_i32, &1_i32);
+
+        let nft_addr = env.register_contract(None, ClPositionNft);
+        let nft = ClPositionNftClient::new(&env, &nft_addr);
+        nft.initialize(&admin, &cl_addr);
+
+        client.set_position_nft(&admin, &Some(nft_addr.clone()));
+        assert_eq!(client.position_nft(), Some(nft_addr));
+
+        StellarAssetClient::new(&env, &token_a).mint(&alice, &1_000_000_i128);
+        StellarAssetClient::new(&env, &token_b).mint(&alice, &1_000_000_i128);
+        client.mint_position(
+            &alice,
+            &-100_i32,
+            &100_i32,
+            &100_000_i128,
+            &100_000_i128,
+            &0_i128,
+            &0_i128,
+            &u64::MAX,
+        );
+
+        assert_eq!(nft.owner_of(&0_u64), alice);
+        assert_eq!(
+            client.position_token_id(&alice, &-100_i32, &100_i32),
+            Some(0_u64)
         );
     }
 
@@ -8957,6 +9461,37 @@ mod test_single_token_deposit {
     }
 
     #[test]
+    fn cannot_detach_nft_contract_while_positions_tokenized() {
+        let env = Env::default();
+        let f = setup_with_nft(&env);
+
+        assert_eq!(
+            f.client.try_set_position_nft(&f.admin, &None),
+            Err(Ok(ClError::NftContractChangeBlocked))
+        );
+        assert_eq!(f.client.position_nft(), Some(f.nft_addr.clone()));
+        assert_eq!(f.nft.owner_of(&0_u64), f.alice);
+    }
+
+    #[test]
+    fn can_detach_nft_contract_after_tokenized_positions_are_burned() {
+        let env = Env::default();
+        let f = setup_with_nft(&env);
+        f.client
+            .burn_position_by_token_id(&f.alice, &0_u64, &f.liquidity);
+
+        assert!(f.nft.try_owner_of(&0_u64).is_err());
+        assert_eq!(f.client.position_of_token(&0_u64), None);
+        assert_eq!(
+            f.client.position_token_id(&f.alice, &f.lower, &f.upper),
+            None
+        );
+
+        f.client.set_position_nft(&f.admin, &None);
+        assert_eq!(f.client.position_nft(), None);
+    }
+
+    #[test]
     fn cannot_change_nft_contract_after_positions_tokenized() {
         // Regression test for vulnerability: changing DataKey::PositionNft to a
         // different contract after positions have been minted would orphan the
@@ -9009,10 +9544,6 @@ mod test_single_token_deposit {
             .unwrap()
             .unwrap();
         assert_eq!(err, ClError::NftContractChangeBlocked);
-
-        // Changing to None (detach) should still be allowed.
-        client.set_position_nft(&admin, &None);
-        assert_eq!(client.position_nft(), None);
 
         // Re-attaching the same contract is allowed.
         client.set_position_nft(&admin, &Some(nft_v1.clone()));
@@ -11095,6 +11626,11 @@ mod test_range_order_fill_status {
 }
 
 #[cfg(test)]
+mod tests_boundary_progress;
+
+#[cfg(test)]
+mod tests_bitmap_index;
+#[cfg(test)]
 mod tests_issue_1100;
 #[cfg(test)]
 mod tests_issue_1102;
@@ -11378,6 +11914,43 @@ mod test_issue_1099_tick_sqrt_price_precision {
         assert_eq!(pool_a_gained, trader_a_spent);
         assert_eq!(trader_b_received, out);
         assert_eq!(pool_b_paid, out);
+    }
+
+    #[test]
+    fn exact_out_enters_initialized_range_at_current_boundary() {
+        let env = Env::default();
+        let tick = -69_050;
+        let (pool, trader, token_a, token_b, client) = setup_low_price_pool(&env, 30, tick, 1);
+        client.mint_position(
+            &trader,
+            &(tick - 10),
+            &tick,
+            &0,
+            &1_000_000_000,
+            &0,
+            &0,
+            &u64::MAX,
+        );
+        let before = client.get_pool_state();
+        assert_eq!(before.active_liquidity, 0);
+
+        let target_out = 50_000;
+        let limit = ConcentratedLiquidity::tick_to_sqrt_price_x96(tick - 10);
+        let quoted_in = client.quote_exact_out(&true, &target_out, &limit);
+        assert!(quoted_in > 0);
+        let token_a = soroban_sdk::token::Client::new(&env, &token_a);
+        let token_b = soroban_sdk::token::Client::new(&env, &token_b);
+        let pool_a = token_a.balance(&pool);
+        let pool_b = token_b.balance(&pool);
+
+        let paid_in =
+            client.swap_exact_out(&trader, &true, &target_out, &limit, &quoted_in, &u64::MAX);
+        let after = client.get_pool_state();
+        assert_eq!(paid_in, quoted_in);
+        assert_eq!(token_a.balance(&pool) - pool_a, paid_in);
+        assert_eq!(pool_b - token_b.balance(&pool), target_out);
+        assert!(after.current_tick < tick);
+        assert!(after.sqrt_price < before.sqrt_price && after.sqrt_price >= limit);
     }
 
     #[test]

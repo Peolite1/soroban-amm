@@ -61,6 +61,10 @@ pub enum TwapError {
     NoPendingKeeper = 20,
     /// `accept_keeper` was called by an address other than the pending keeper.
     WrongPendingKeeper = 21,
+    /// `delete_snapshot` refused to remove the newest snapshot or to drop the
+    /// pool below two retained snapshots, which would leave TWAP reads without
+    /// a valid pair of cumulative-price points.
+    CannotDeleteRequiredSnapshot = 22,
 }
 
 #[contracttype]
@@ -508,7 +512,15 @@ impl TwapConsumer {
     }
 
     /// Deletes a price snapshot from persistent storage.
-    /// Returns `TwapError::NoSnapshotFound` and emits no event if the snapshot does not exist.
+    ///
+    /// Refuses with `TwapError::CannotDeleteRequiredSnapshot` (leaving storage
+    /// unchanged and emitting no event) if `ledger_ts` is the newest remaining
+    /// snapshot or if removing it would leave fewer than two snapshots
+    /// (`snapshots.len() < 3`), preserving the minimum two-point history needed
+    /// for TWAP reads.
+    ///
+    /// Returns `TwapError::NoSnapshotFound` and emits no event if the snapshot
+    /// does not exist.
     pub fn delete_snapshot(env: Env, pool: Address, ledger_ts: u64) -> Result<(), TwapError> {
         Self::extend_instance_ttl(&env);
         Self::require_keeper(&env)?;
@@ -517,6 +529,9 @@ impl TwapConsumer {
             .iter()
             .position(|entry| entry.0 == ledger_ts)
             .ok_or(TwapError::NoSnapshotFound)?;
+        if index as u32 == snapshots.len() - 1 || snapshots.len() < 3 {
+            return Err(TwapError::CannotDeleteRequiredSnapshot);
+        }
         snapshots.remove(index as u32);
         Self::store_snapshots(&env, &pool, &snapshots);
         soroban_amm_sdk::emit_versioned_event!(&env, (symbol_short!("snap_del"), pool), ledger_ts);
@@ -530,6 +545,12 @@ impl TwapConsumer {
     /// covers [`Self::LONGEST_TWAP_WINDOW`] for a keeper saving as often as
     /// every 3 minutes. Once reached, each save drops the oldest snapshot.
     pub const MAX_SNAPSHOTS_PER_POOL: u32 = 512;
+    /// Ceiling on how many snapshots one `prune_snapshots` call, or one pool's
+    /// share of a `prune_all` call, may remove, whatever `max_to_remove` the
+    /// caller passes (#1333). Kept well below [`Self::MAX_SNAPSHOTS_PER_POOL`]
+    /// so no single call can empty a full pool history: shrinking a pool from
+    /// the hard cap down to a tighter retention policy takes several calls.
+    pub const MAX_PRUNE_PER_CALL: u32 = 64;
 
     fn load_snapshots(env: &Env, pool: &Address) -> Vec<SnapshotEntry> {
         env.storage()
@@ -720,10 +741,11 @@ impl TwapConsumer {
         }
     }
 
-    /// Removes up to `max_to_remove` snapshots from `snapshots` that the
-    /// retention policy (or [`Self::MAX_SNAPSHOTS_PER_POOL`]) makes eligible,
-    /// oldest first, emitting a `pruned` event if any were removed. Storing
-    /// the list is left to the caller.
+    /// Removes up to `max_to_remove` (clamped to [`Self::MAX_PRUNE_PER_CALL`])
+    /// snapshots from `snapshots` that the retention policy (or
+    /// [`Self::MAX_SNAPSHOTS_PER_POOL`]) makes eligible, oldest first,
+    /// emitting a `pruned` event if any were removed. Storing the list is left
+    /// to the caller.
     fn prune_list(
         env: &Env,
         pool: &Address,
@@ -731,6 +753,7 @@ impl TwapConsumer {
         max_to_remove: u32,
     ) -> u32 {
         let total_count = snapshots.len();
+        let max_to_remove = max_to_remove.min(Self::MAX_PRUNE_PER_CALL);
         if max_to_remove == 0 || total_count == 0 {
             return 0;
         }
@@ -744,58 +767,83 @@ impl TwapConsumer {
         };
         let current_ts = env.ledger().timestamp();
 
-        let mut remove_count = 0u32;
+        let mut removed_count = 0u32;
         let mut remaining = Vec::new(env);
         for entry in snapshots.iter() {
             let ts = entry.0;
-            let remaining_count = total_count - remove_count;
+            let remaining_count = total_count - removed_count;
 
             let age_eligible = policy.max_age_seconds > 0
                 && current_ts >= ts.saturating_add(policy.max_age_seconds);
             let count_eligible = remaining_count > max_count;
 
-            if (age_eligible || count_eligible) && remove_count < max_to_remove {
-                remove_count += 1;
+            if (age_eligible || count_eligible) && removed_count < max_to_remove {
+                removed_count += 1;
             } else {
                 remaining.push_back(entry);
             }
         }
 
-        if remove_count > 0 {
+        if removed_count > 0 {
             *snapshots = remaining;
             let oldest_remaining_ts = snapshots.first().map(|entry| entry.0).unwrap_or(0);
             soroban_amm_sdk::emit_versioned_event!(
                 env,
                 (symbol_short!("pruned"), pool.clone()),
-                (remove_count, oldest_remaining_ts)
+                (removed_count, oldest_remaining_ts)
             );
         }
-        remove_count
+        removed_count
     }
 
-    /// Permissionless bounded pruning for a pool according to the active retention policy.
-    pub fn prune_snapshots(env: Env, pool: Address, max_to_remove: u32) -> u32 {
-        Self::extend_instance_ttl(&env);
-        let mut snapshots = Self::load_snapshots(&env, &pool);
-        let removed = Self::prune_list(&env, &pool, &mut snapshots, max_to_remove);
+    /// Prunes one pool's snapshots without an authorization check; shared by
+    /// [`Self::prune_snapshots`] and [`Self::prune_all`].
+    fn prune_pool(env: &Env, pool: &Address, max_to_remove: u32) -> u32 {
+        let mut snapshots = Self::load_snapshots(env, pool);
+        let removed = Self::prune_list(env, pool, &mut snapshots, max_to_remove);
         if removed > 0 {
-            Self::store_snapshots(&env, &pool, &snapshots);
+            Self::store_snapshots(env, pool, &snapshots);
         }
         removed
     }
 
-    /// Permissionless sweep across all tracked pools, removing up to `max_to_remove_per_pool`
-    /// eligible snapshots per pool. Fault-isolated so one pool cannot abort the sweep.
-    pub fn prune_all(env: Env, max_to_remove_per_pool: u32) -> u32 {
+    /// Keeper-only bounded pruning for a pool according to the active
+    /// retention policy. Returns the number of snapshots removed.
+    ///
+    /// Removes at most `min(max_to_remove, MAX_PRUNE_PER_CALL)` snapshots
+    /// (see `TwapConsumer::MAX_PRUNE_PER_CALL`), and only ones the retention policy
+    /// or `TwapConsumer::MAX_SNAPSHOTS_PER_POOL` makes eligible, oldest first.
+    ///
+    /// Requires the keeper's authorization, like `delete_snapshot`: retained
+    /// snapshots are the input to every TWAP read, so deleting them is not
+    /// left to arbitrary callers (#1333). Returns `TwapError::NotInitialized`
+    /// if no keeper is set.
+    pub fn prune_snapshots(env: Env, pool: Address, max_to_remove: u32) -> Result<u32, TwapError> {
         Self::extend_instance_ttl(&env);
+        Self::require_keeper(&env)?;
+        Ok(Self::prune_pool(&env, &pool, max_to_remove))
+    }
+
+    /// Keeper-only sweep across all tracked pools. Returns the total number
+    /// of snapshots removed.
+    ///
+    /// Each pool may have at most
+    /// `min(max_to_remove_per_pool, MAX_PRUNE_PER_CALL)` eligible snapshots
+    /// removed per call (see `TwapConsumer::MAX_PRUNE_PER_CALL`), so one call removes
+    /// at most `MAX_PRUNE_PER_CALL * MAX_TRACKED_POOLS` in total. Requires the
+    /// keeper's authorization, like `TwapConsumer::prune_snapshots`. Fault-isolated
+    /// so one pool cannot abort the sweep.
+    pub fn prune_all(env: Env, max_to_remove_per_pool: u32) -> Result<u32, TwapError> {
+        Self::extend_instance_ttl(&env);
+        Self::require_keeper(&env)?;
         let tracked: Vec<Address> = Self::get_tracked_pools(env.clone());
         let mut total_removed = 0u32;
         for i in 0..tracked.len() {
             let pool = tracked.get(i).unwrap();
-            let removed = Self::prune_snapshots(env.clone(), pool, max_to_remove_per_pool);
+            let removed = Self::prune_pool(&env, &pool, max_to_remove_per_pool);
             total_removed = total_removed.saturating_add(removed);
         }
-        total_removed
+        Ok(total_removed)
     }
 
     /// Binary-search the pool's snapshots for the most recent one at or
@@ -884,7 +932,10 @@ impl TwapConsumer {
         if elapsed == 0 {
             return Err(TwapError::ElapsedZero);
         }
-        let delta = (cum_a_now as u128).wrapping_sub(snapshot.1 as u128) as i128;
+        let delta = cum_a_now
+            .checked_sub(snapshot.1)
+            .filter(|&d| d >= 0)
+            .ok_or(TwapError::InvalidTwapPrice)?;
         Ok(TwapResult {
             twap: delta / i128::from(elapsed),
             window_used: elapsed,
@@ -980,8 +1031,14 @@ impl TwapConsumer {
         let snapshot = Self::floor_snapshot_entry(&env, &pool, then_ts)
             .ok_or(TwapError::InsufficientHistory)?;
 
-        let delta_a = (cum_a_now as u128).wrapping_sub(snapshot.1 as u128) as i128;
-        let delta_b = (cum_b_now as u128).wrapping_sub(snapshot.2 as u128) as i128;
+        let delta_a = cum_a_now
+            .checked_sub(snapshot.1)
+            .filter(|&d| d >= 0)
+            .ok_or(TwapError::InvalidTwapPrice)?;
+        let delta_b = cum_b_now
+            .checked_sub(snapshot.2)
+            .filter(|&d| d >= 0)
+            .ok_or(TwapError::InvalidTwapPrice)?;
         let elapsed = i128::from(ledger_ts_now - snapshot.0);
         if elapsed <= 0 {
             return Err(TwapError::ElapsedZero);
@@ -1217,6 +1274,7 @@ mod tests {
     use super::*;
 
     use amm::{AmmPool, AmmPoolClient};
+    use factory::{Factory, FactoryClient};
     use soroban_sdk::{
         testutils::{storage::Instance as _, Address as _, Events as _, Ledger},
         token::{StellarAssetClient, TokenClient as StellarTokenClient},
@@ -1304,6 +1362,74 @@ mod tests {
         consumer.save_snapshot(&amm_addr);
 
         (amm_addr, consumer)
+    }
+
+    fn setup_real_factory_pools(env: &Env) -> (Address, Address, Address, TwapConsumerClient<'_>) {
+        env.budget().reset_unlimited();
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let amm_hash = env.deployer().upload_contract_wasm(amm::WASM);
+        let token_hash = env.deployer().upload_contract_wasm(token::WASM);
+        let cl_hash = env
+            .deployer()
+            .upload_contract_wasm(concentrated_liquidity::WASM);
+
+        let factory_addr = env.register_contract(None, Factory);
+        let factory = FactoryClient::new(env, &factory_addr);
+        factory.initialize(&admin, &amm_hash, &token_hash);
+        factory.set_cl_wasm_hash(&cl_hash);
+
+        let (ta, _ta_sac) = create_sac(env, &admin);
+        let (tb, _tb_sac) = create_sac(env, &admin);
+        let (amm_pool, _gov) =
+            factory.create_pool_with_fee_bps(&admin, &ta.address, &tb.address, &30, &None);
+        let cl_pool = factory.create_cl_pool(&admin, &ta.address, &tb.address, &30, &0);
+
+        let consumer_addr = env.register_contract(None, TwapConsumer);
+        let consumer = TwapConsumerClient::new(env, &consumer_addr);
+        consumer.initialize(&admin);
+        consumer.configure_public_snapshots(&factory_addr, &300);
+
+        (amm_pool, cl_pool, factory_addr, consumer)
+    }
+
+    #[test]
+    fn test_public_cl_save_succeeds_for_factory_cl_pool_and_bumps_count() {
+        let env = Env::default();
+        env.ledger().set_timestamp(10_000);
+        let (amm_pool, cl_pool, _factory_addr, consumer) = setup_real_factory_pools(&env);
+
+        assert!(amm_pool != cl_pool);
+        assert_eq!(consumer.get_snapshot_count(&cl_pool), 0);
+        consumer.save_cl_snapshot_public(&cl_pool);
+        assert_eq!(consumer.get_snapshot_count(&cl_pool), 1);
+    }
+
+    #[test]
+    fn test_public_cl_save_rejects_unknown_pool() {
+        let env = Env::default();
+        env.ledger().set_timestamp(10_000);
+        let (_amm_pool, _cl_pool, _factory_addr, consumer) = setup_real_factory_pools(&env);
+        let unknown = env.register_contract(None, MockClPool);
+
+        assert_eq!(
+            consumer.try_save_cl_snapshot_public(&unknown),
+            Err(Ok(TwapError::PoolNotRegistered))
+        );
+    }
+
+    #[test]
+    fn test_public_cl_save_second_save_is_rate_limited() {
+        let env = Env::default();
+        env.ledger().set_timestamp(10_000);
+        let (_amm_pool, cl_pool, _factory_addr, consumer) = setup_real_factory_pools(&env);
+
+        consumer.save_cl_snapshot_public(&cl_pool);
+        assert_eq!(
+            consumer.try_save_cl_snapshot_public(&cl_pool),
+            Err(Ok(TwapError::SnapshotRateLimited))
+        );
+        assert_eq!(consumer.get_snapshot_count(&cl_pool), 1);
     }
 
     #[test]
@@ -1759,19 +1885,103 @@ mod tests {
         consumer.initialize(&admin);
         consumer.save_snapshot(&amm_addr);
 
+        // With only one snapshot, deleting it is refused (newest and < 3).
+        assert_eq!(
+            consumer.try_delete_snapshot(&amm_addr, &10_000),
+            Err(Ok(TwapError::CannotDeleteRequiredSnapshot))
+        );
+
         env.ledger().set_timestamp(10_060);
         let whale = Address::generate(&env);
         ta_sac.mint(&whale, &1_000_i128);
         amm.swap(&whale, &ta.address, &1_000_i128, &0_i128, &10_060_u64);
         assert_eq!(consumer.get_twap_price(&amm_addr, &60_u64), 1_000_000);
+        consumer.save_snapshot(&amm_addr);
 
-        consumer.delete_snapshot(&amm_addr, &10_000);
+        // With only two snapshots, deleting either is refused so history is not bricked.
+        assert_eq!(
+            consumer.try_delete_snapshot(&amm_addr, &10_000),
+            Err(Ok(TwapError::CannotDeleteRequiredSnapshot))
+        );
+        assert_eq!(
+            consumer.try_delete_snapshot(&amm_addr, &10_060),
+            Err(Ok(TwapError::CannotDeleteRequiredSnapshot))
+        );
+        assert_eq!(consumer.get_snapshot_count(&amm_addr), 2);
 
-        // The only snapshot at/before then_ts=10_000 was removed from the
-        // timestamp index along with the snapshot itself, so there is no
-        // floor entry left — this is InsufficientHistory.
-        let result = consumer.try_get_twap_price(&amm_addr, &60_u64);
-        assert_eq!(result, Err(Ok(TwapError::InsufficientHistory)));
+        // Save a third snapshot so an interior entry can be legally deleted.
+        env.ledger().set_timestamp(10_120);
+        ta_sac.mint(&whale, &1_000_i128);
+        amm.swap(&whale, &ta.address, &1_000_i128, &0_i128, &10_120_u64);
+        consumer.save_snapshot(&amm_addr);
+        assert_eq!(consumer.get_snapshot_count(&amm_addr), 3);
+
+        // Deleting the newest snapshot is still refused even with 3 snapshots.
+        let events_before = env.events().all().len();
+        assert_eq!(
+            consumer.try_delete_snapshot(&amm_addr, &10_120),
+            Err(Ok(TwapError::CannotDeleteRequiredSnapshot))
+        );
+        assert_eq!(env.events().all().len(), events_before);
+        assert_eq!(consumer.get_snapshot_count(&amm_addr), 3);
+
+        // Deleting the interior snapshot (10_060) succeeds and emits one snap_del event.
+        consumer.delete_snapshot(&amm_addr, &10_060);
+        assert_eq!(env.events().all().len(), events_before + 1);
+        assert_eq!(consumer.get_snapshot_count(&amm_addr), 2);
+
+        // A window whose floor snapshot (10_000) survives still returns a positive TWAP.
+        let twap = consumer.get_twap_price(&amm_addr, &120_u64);
+        assert!(twap > 0);
+    }
+
+    #[test]
+    fn test_delete_snapshot_refuses_newest_and_leaves_storage_and_events_unchanged() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let keeper = Address::generate(&env);
+        let pool = Address::generate(&env);
+        env.ledger().set_timestamp(300);
+        let consumer_addr = env.register_contract(None, TwapConsumer);
+        let consumer = TwapConsumerClient::new(&env, &consumer_addr);
+        consumer.initialize(&keeper);
+
+        seed_snapshots(&env, &consumer_addr, &pool, 100, &[100, 200, 300]);
+        let events_before = env.events().all().len();
+
+        assert_eq!(
+            consumer.try_delete_snapshot(&pool, &300),
+            Err(Ok(TwapError::CannotDeleteRequiredSnapshot))
+        );
+        assert_eq!(env.events().all().len(), events_before);
+        let stamps = consumer.list_snapshot_timestamps(&pool, &0, &10);
+        assert_eq!(stamps.len(), 3);
+        assert_eq!(stamps.get(2).unwrap(), 300);
+    }
+
+    #[test]
+    fn test_delete_snapshot_refuses_when_only_two_remain() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let keeper = Address::generate(&env);
+        let pool = Address::generate(&env);
+        env.ledger().set_timestamp(200);
+        let consumer_addr = env.register_contract(None, TwapConsumer);
+        let consumer = TwapConsumerClient::new(&env, &consumer_addr);
+        consumer.initialize(&keeper);
+
+        seed_snapshots(&env, &consumer_addr, &pool, 100, &[100, 200]);
+        let events_before = env.events().all().len();
+
+        assert_eq!(
+            consumer.try_delete_snapshot(&pool, &100),
+            Err(Ok(TwapError::CannotDeleteRequiredSnapshot))
+        );
+        assert_eq!(env.events().all().len(), events_before);
+        let stamps = consumer.list_snapshot_timestamps(&pool, &0, &10);
+        assert_eq!(stamps.len(), 2);
+        assert_eq!(stamps.get(0).unwrap(), 100);
+        assert_eq!(stamps.get(1).unwrap(), 200);
     }
 
     #[test]
@@ -1921,8 +2131,14 @@ mod tests {
         let consumer = TwapConsumerClient::new(&env, &consumer_addr);
         consumer.initialize(&keeper);
 
-        // Manually write snapshot to storage
-        seed_snapshots(&env, &consumer_addr, &pool, 100, &[ledger_ts]);
+        // Manually write 3 snapshots to storage so deleting an older entry is allowed.
+        seed_snapshots(
+            &env,
+            &consumer_addr,
+            &pool,
+            100,
+            &[ledger_ts, ledger_ts + 100, ledger_ts + 200],
+        );
 
         consumer.delete_snapshot(&pool, &ledger_ts);
 
@@ -2184,6 +2400,97 @@ mod tests {
         let remaining = consumer.list_snapshot_timestamps(&pool, &0, &10);
         assert_eq!(remaining.get(0).unwrap(), 6);
         assert_eq!(remaining.get(4).unwrap(), 10);
+    }
+
+    /// Timestamps `1..=MAX_SNAPSHOTS_PER_POOL`: a full pool history, all of it
+    /// age-eligible under the default policy once the ledger passes 7 days.
+    fn full_history() -> std::vec::Vec<u64> {
+        (1..=u64::from(TwapConsumer::MAX_SNAPSHOTS_PER_POOL)).collect()
+    }
+
+    #[test]
+    fn test_prune_ceiling_is_well_below_snapshot_cap() {
+        const {
+            assert!(TwapConsumer::MAX_PRUNE_PER_CALL > TwapConsumer::AMORTIZED_PRUNE_LIMIT);
+            assert!(TwapConsumer::MAX_PRUNE_PER_CALL * 4 <= TwapConsumer::MAX_SNAPSHOTS_PER_POOL);
+        }
+    }
+
+    #[test]
+    fn test_prune_snapshots_oversized_request_is_capped() {
+        // #1333: on main a `u32::MAX` request removed all 512 snapshots in
+        // one call. It must now remove at most MAX_PRUNE_PER_CALL.
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let pool = Address::generate(&env);
+        let consumer_addr = env.register_contract(None, TwapConsumer);
+        let consumer = TwapConsumerClient::new(&env, &consumer_addr);
+        consumer.initialize(&admin);
+
+        seed_snapshots(&env, &consumer_addr, &pool, 1000, &full_history());
+        env.ledger().set_timestamp(1_000_000);
+        let full = TwapConsumer::MAX_SNAPSHOTS_PER_POOL;
+        let cap = TwapConsumer::MAX_PRUNE_PER_CALL;
+
+        assert_eq!(consumer.prune_snapshots(&pool, &u32::MAX), cap);
+        assert_eq!(consumer.get_snapshot_count(&pool), full - cap);
+        // Oldest first: the next retained snapshot is the (cap + 1)-th.
+        assert_eq!(
+            consumer.list_snapshot_timestamps(&pool, &0, &1).get(0),
+            Some(u64::from(cap) + 1)
+        );
+
+        // The ceiling is per call: a second oversized call removes the next
+        // batch, again no more than the ceiling.
+        assert_eq!(consumer.prune_snapshots(&pool, &u32::MAX), cap);
+        assert_eq!(consumer.get_snapshot_count(&pool), full - 2 * cap);
+    }
+
+    #[test]
+    fn test_prune_all_oversized_request_is_capped_per_pool() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let pool1 = Address::generate(&env);
+        let pool2 = Address::generate(&env);
+        let consumer_addr = env.register_contract(None, TwapConsumer);
+        let consumer = TwapConsumerClient::new(&env, &consumer_addr);
+        consumer.initialize(&admin);
+
+        consumer.add_tracked_pool(&pool1, &PoolType::Amm);
+        consumer.add_tracked_pool(&pool2, &PoolType::Amm);
+        seed_snapshots(&env, &consumer_addr, &pool1, 1000, &full_history());
+        seed_snapshots(&env, &consumer_addr, &pool2, 1000, &full_history());
+        env.ledger().set_timestamp(1_000_000);
+        let full = TwapConsumer::MAX_SNAPSHOTS_PER_POOL;
+        let cap = TwapConsumer::MAX_PRUNE_PER_CALL;
+
+        assert_eq!(consumer.prune_all(&u32::MAX), cap * 2);
+        assert_eq!(consumer.get_snapshot_count(&pool1), full - cap);
+        assert_eq!(consumer.get_snapshot_count(&pool2), full - cap);
+    }
+
+    #[test]
+    fn test_prune_requires_initialized_keeper() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let pool = Address::generate(&env);
+        let consumer_addr = env.register_contract(None, TwapConsumer);
+        let consumer = TwapConsumerClient::new(&env, &consumer_addr);
+
+        seed_snapshots(&env, &consumer_addr, &pool, 1000, &[1, 2, 3]);
+        env.ledger().set_timestamp(1_000_000);
+
+        assert_eq!(
+            consumer.try_prune_snapshots(&pool, &10),
+            Err(Ok(TwapError::NotInitialized))
+        );
+        assert_eq!(
+            consumer.try_prune_all(&10),
+            Err(Ok(TwapError::NotInitialized))
+        );
+        assert_eq!(consumer.get_snapshot_count(&pool), 3);
     }
 
     #[test]
@@ -2606,10 +2913,15 @@ mod tests {
         consumer.save_snapshot(&pool);
         assert_eq!(consumer.get_snapshot_count(&pool), 2);
 
+        env.ledger().set_timestamp(10_200);
+        consumer.save_snapshot(&pool);
+        assert_eq!(consumer.get_snapshot_count(&pool), 3);
+
         consumer.delete_snapshot(&pool, &10_000);
         let stamps = consumer.list_snapshot_timestamps(&pool, &0, &10);
-        assert_eq!(stamps.len(), 1);
+        assert_eq!(stamps.len(), 2);
         assert_eq!(stamps.get(0).unwrap(), 10_100);
+        assert_eq!(stamps.get(1).unwrap(), 10_200);
         assert_eq!(
             consumer.try_delete_snapshot(&pool, &10_000),
             Err(Ok(TwapError::NoSnapshotFound))
@@ -3661,4 +3973,88 @@ mod tests {
             c.get_pending_keeper();
         });
     }
+
+    // Backwards AMM accumulator -------------------------------------------------
+
+    mod mock_amm_pool {
+        use super::AmmPoolInfo;
+        use soroban_sdk::{contract, contractimpl, symbol_short, Env};
+
+        #[contract]
+        pub struct MockAmmPool;
+
+        #[contractimpl]
+        impl MockAmmPool {
+            pub fn set_cumulative(env: Env, cum_a: i128, cum_b: i128, ts: u64) {
+                env.storage()
+                    .instance()
+                    .set(&symbol_short!("cum"), &(cum_a, cum_b, ts));
+            }
+
+            pub fn get_price_cumulative(env: Env) -> (i128, i128, u64) {
+                env.storage()
+                    .instance()
+                    .get(&symbol_short!("cum"))
+                    .unwrap_or((100_000_000_i128, 100_000_000_i128, 10_000_u64))
+            }
+
+            pub fn get_info(env: Env) -> AmmPoolInfo {
+                let addr = env.current_contract_address();
+                AmmPoolInfo {
+                    token_a: addr.clone(),
+                    token_b: addr.clone(),
+                    reserve_a: 1_000_000,
+                    reserve_b: 1_000_000,
+                    total_shares: 1_000_000,
+                    fee_bps: 30,
+                    flash_loan_fee_bps: 0,
+                    admin: addr.clone(),
+                    fee_recipient: addr,
+                    protocol_fee_bps: 0,
+                    lp_rebate_bps: 0,
+                }
+            }
+        }
+    }
+
+    use mock_amm_pool::{MockAmmPool, MockAmmPoolClient};
+
+    #[test]
+    fn test_backwards_amm_cumulative_returns_invalid_twap_price() {
+        let env = test_env();
+        let admin = Address::generate(&env);
+        let consumer = new_consumer(&env, &admin);
+        let pool_addr = env.register_contract(None, MockAmmPool);
+        let pool = MockAmmPoolClient::new(&env, &pool_addr);
+
+        pool.set_cumulative(&500_000_000_i128, &500_000_000_i128, &10_000_u64);
+        consumer.save_snapshot(&pool_addr);
+
+        env.ledger().set_timestamp(10_060);
+        // Cumulative goes backwards (e.g. pool upgrade / reset).
+        pool.set_cumulative(&100_000_000_i128, &600_000_000_i128, &10_060_u64);
+
+        assert_eq!(
+            consumer.try_get_twap_price(&pool_addr, &60),
+            Err(Ok(TwapError::InvalidTwapPrice))
+        );
+        assert_eq!(
+            consumer.try_get_twap_price_detailed(&pool_addr, &60),
+            Err(Ok(TwapError::InvalidTwapPrice))
+        );
+        assert_eq!(
+            consumer.try_get_twap_both(&pool_addr, &60),
+            Err(Ok(TwapError::InvalidTwapPrice))
+        );
+
+        // Also test when cum_a increases normally but cum_b goes backwards.
+        pool.set_cumulative(&600_000_000_i128, &100_000_000_i128, &10_060_u64);
+        assert_eq!(
+            consumer.try_get_twap_both(&pool_addr, &60),
+            Err(Ok(TwapError::InvalidTwapPrice))
+        );
+    }
 }
+
+#[cfg(test)]
+mod auth_tests;
