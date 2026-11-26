@@ -163,6 +163,7 @@ export interface MetricsSnapshot {
   failed: number;
   timedOut: number;
   deadLettered: number;
+  deadLetterEvictions: number;
   retries: number;
   shortCircuited: number;
   circuits: CircuitSnapshot[];

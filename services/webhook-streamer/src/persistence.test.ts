@@ -661,4 +661,64 @@ describe("the running service", () => {
       await new Promise<void>((resolve) => { rpcServer.closeAllConnections(); rpcServer.close(() => resolve()); });
     }
   });
+
+  it("reports dead-letter evictions on GET /metrics after the queue overflows", async () => {
+    const events = [rpcEvent(100), rpcEvent(101)];
+    let served = 0;
+    const rpcServer = createServer((req, res) => {
+      let body = "";
+      req.on("data", (c) => (body += c));
+      req.on("end", () => {
+        const { method } = JSON.parse(body) as { method: string };
+        res.setHeader("content-type", "application/json");
+        if (method === "getHealth") {
+          res.end(JSON.stringify({ jsonrpc: "2.0", id: 1, result: { status: "healthy", oldestLedger: 1, latestLedger: 1000 } }));
+          return;
+        }
+        const event = served < events.length ? events[served] : undefined;
+        served += 1;
+        const page = event ? [event] : [];
+        res.end(JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          result: { events: page, latestLedger: 1000, ...(event ? { cursor: event.pagingToken } : {}) },
+        }));
+      });
+    });
+    await new Promise<void>((resolve) => rpcServer.listen(0, "127.0.0.1", resolve));
+    const receiver = await startReceiver(() => ({ status: 400 }));
+    const service = await startService({
+      SOROBAN_RPC_URL: `http://127.0.0.1:${(rpcServer.address() as AddressInfo).port}`,
+      CONTRACT_IDS: "CPOOL",
+      POLL_INTERVAL_MS: "20",
+      DELIVERY_TIMEOUT_MS: "1000",
+      DEAD_LETTER_MAX: "1",
+      CIRCUIT_FAILURE_THRESHOLD: "100",
+    });
+    try {
+      const created = await fetch(`http://127.0.0.1:${service.port}/webhooks`, {
+        method: "POST",
+        body: JSON.stringify({ url: receiver.url, eventType: "swap" }),
+      });
+      assert.equal(created.status, 201);
+
+      type Metrics = { deadLettered?: number; deadLetterEvictions?: number };
+      let metrics: Metrics = {};
+      const deadline = Date.now() + 5_000;
+      while (Date.now() < deadline) {
+        const response = await fetch(`http://127.0.0.1:${service.port}/metrics`);
+        metrics = (await response.json()) as Metrics;
+        if ((metrics.deadLetterEvictions ?? 0) >= 1) break;
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      assert.equal(metrics.deadLetterEvictions, 1);
+      assert.ok((metrics.deadLettered ?? 0) >= 2);
+      assert.match(service.output(), /\[dead-letter\] evicted oldest entry deadLetterId=\S+ event=\S+ subscription=\S+/);
+    } finally {
+      service.signal("SIGTERM");
+      await service.exited;
+      await receiver.close();
+      await new Promise<void>((resolve) => { rpcServer.closeAllConnections(); rpcServer.close(() => resolve()); });
+    }
+  });
 });
