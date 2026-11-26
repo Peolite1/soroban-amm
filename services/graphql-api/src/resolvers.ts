@@ -6,6 +6,7 @@ import { GraphQLError } from "graphql";
 import { PubSub } from "graphql-subscriptions";
 import {
   defaultIndexer,
+  InvalidComparisonError,
   InvalidMetricError,
   InvalidThresholdError,
   type AlertConfig,
@@ -35,7 +36,18 @@ export const resolvers = {
       _: unknown,
       { poolId, limit }: { poolId?: string; limit?: number },
       context?: GraphQLContext,
-    ) => activeIndexer(context).getEvents(poolId, limit ?? 100),
+    ) => {
+      try {
+        return activeIndexer(context).getEvents(poolId, limit ?? 100);
+      } catch (error) {
+        if (error instanceof RangeError) {
+          throw new GraphQLError(error.message, {
+            extensions: { code: "BAD_USER_INPUT" },
+          });
+        }
+        throw error;
+      }
+    },
     positions: (_: unknown, { owner }: { owner?: string }, context?: GraphQLContext) =>
       activeIndexer(context).getPositions(owner),
     priceHistory: (
@@ -71,28 +83,35 @@ export const resolvers = {
       {
         poolId,
         metric,
+        comparison,
         thresholdBps,
         thresholdValue,
       }: {
         poolId: string;
         metric: string;
+        comparison?: string;
         thresholdBps?: number;
         thresholdValue?: number;
       },
       context?: GraphQLContext,
     ): AlertConfig | Promise<AlertConfig> => {
+      const indexer = activeIndexer(context);
       try {
-        const config = activeIndexer(context).setAlertConfig({
+        const config = indexer.validateAlertConfig({
           poolId,
           metric: metric as AlertMetric,
+          comparison: comparison as "above" | "below" | undefined,
           thresholdBps,
           thresholdValue,
         });
+        // Durable first: a store failure must leave the in-memory indexer
+        // untouched, otherwise memory and the store diverge permanently.
         return context?.store
-          ? context.store.setAlertConfig(config).then(() => config)
-          : config;
+          ? context.store.setAlertConfig(config).then(() => indexer.applyAlertConfig(config))
+          : indexer.applyAlertConfig(config);
       } catch (error) {
-        if (error instanceof InvalidMetricError || error instanceof InvalidThresholdError) {
+        if (error instanceof InvalidMetricError || error instanceof InvalidThresholdError ||
+            error instanceof InvalidComparisonError) {
           throw new GraphQLError(error.message, {
             extensions: { code: "BAD_USER_INPUT" },
           });
@@ -105,10 +124,12 @@ export const resolvers = {
       { poolId, metric }: { poolId: string; metric: string },
       context?: GraphQLContext,
     ): boolean | Promise<boolean> => {
-      const removed = activeIndexer(context).removeAlertConfig(poolId, metric);
-      return context?.store
-        ? context.store.removeAlertConfig(poolId, metric).then((stored) => removed || stored)
-        : removed;
+      const indexer = activeIndexer(context);
+      if (!context?.store) return indexer.removeAlertConfig(poolId, metric);
+      return context.store.removeAlertConfig(poolId, metric).then((stored) => {
+        const removed = indexer.removeAlertConfig(poolId, metric);
+        return removed || stored;
+      });
     },
   },
   PoolEvent: {

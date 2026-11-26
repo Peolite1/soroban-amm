@@ -314,6 +314,36 @@
     },
     "batch_auction": {
       "events": {
+        "pause": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "admin"
+            ]
+          }
+        ],
+        "unpause": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "admin"
+            ]
+          }
+        ],
+        "upgraded": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "new_wasm_hash"
+            ]
+          }
+        ],
         "order_submitted": [
           {
             "version": 1,
@@ -579,6 +609,27 @@
     },
     "cl_position_nft": {
       "events": {
+        "accept_transfers_set": [
+          {
+            "version": 1,
+            "topics": 2,
+            "shape": "tuple",
+            "fields": [
+              "accepts"
+            ]
+          }
+        ],
+        "ttl_params_set": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "min_ttl_threshold",
+              "bump_to"
+            ]
+          }
+        ],
         "initialized": [
           {
             "version": 1,
@@ -686,6 +737,21 @@
     },
     "concentrated_liquidity": {
       "events": {
+        "initialized": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "admin",
+              "token_a",
+              "token_b",
+              "fee_bps",
+              "initial_tick",
+              "tick_spacing"
+            ]
+          }
+        ],
         "upgraded": [
           {
             "version": 1,
@@ -842,6 +908,17 @@
             ]
           }
         ],
+        "oracle_cardinality_set": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "old_cardinality",
+              "new_cardinality"
+            ]
+          }
+        ],
         "position_nft_set": [
           {
             "version": 1,
@@ -949,6 +1026,37 @@
             "shape": "tuple",
             "fields": [
               "admin"
+            ]
+          }
+        ],
+        "admin_nominated": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "current_admin",
+              "new_admin"
+            ]
+          }
+        ],
+        "admin_changed": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "new_admin"
+            ]
+          }
+        ],
+        "upgraded": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "new_wasm_hash"
             ]
           }
         ],
@@ -1527,7 +1635,7 @@
             "fields": [
               "campaign_id",
               "provider",
-              "pending",
+              "amount",
               "dist_id"
             ]
           }
@@ -1585,6 +1693,120 @@
             "shape": "tuple",
             "fields": [
               "new_wasm_hash"
+            ]
+          }
+        ]
+      }
+    },
+    "oracle_adapters": {
+      "events": {
+        "admin_changed": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "new_admin"
+            ]
+          }
+        ],
+        "admin_proposed": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "new_admin"
+            ]
+          }
+        ],
+        "consumer_updated": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "consumer"
+            ]
+          }
+        ],
+        "factory_updated": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "factory"
+            ]
+          }
+        ],
+        "fee_tiers_updated": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "fee_tiers"
+            ]
+          }
+        ],
+        "max_age_updated": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "max_age_seconds"
+            ]
+          }
+        ],
+        "mode_updated": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "mode"
+            ]
+          }
+        ],
+        "paused": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "paused"
+            ]
+          }
+        ],
+        "unpaused": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "paused"
+            ]
+          }
+        ],
+        "upgraded": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "new_wasm_hash"
+            ]
+          }
+        ],
+        "window_updated": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "window_seconds"
             ]
           }
         ]
@@ -2006,6 +2228,16 @@
               "unhealthy"
             ]
           }
+        ],
+        "upgraded": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "new_wasm_hash"
+            ]
+          }
         ]
       }
     },
@@ -2293,6 +2525,28 @@
             "shape": "tuple",
             "fields": [
               "registered"
+            ]
+          }
+        ],
+        "staker_index_backfilled": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "added"
+            ]
+          }
+        ],
+        "staker_index_migration_progress": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "offset",
+              "processed",
+              "remaining"
             ]
           }
         ]
