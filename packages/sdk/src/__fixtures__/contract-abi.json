@@ -4653,6 +4653,10 @@
           ]
         },
         {
+          "name": "is_paused",
+          "inputs": []
+        },
+        {
           "name": "list_schedules",
           "inputs": [
             {
@@ -4666,6 +4670,15 @@
             {
               "name": "limit",
               "type": "u32"
+            }
+          ]
+        },
+        {
+          "name": "pause",
+          "inputs": [
+            {
+              "name": "governance",
+              "type": "Address"
             }
           ]
         },
@@ -4743,6 +4756,15 @@
           "inputs": [
             {
               "name": "beneficiary",
+              "type": "Address"
+            }
+          ]
+        },
+        {
+          "name": "unpause",
+          "inputs": [
+            {
+              "name": "governance",
               "type": "Address"
             }
           ]

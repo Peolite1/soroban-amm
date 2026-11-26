@@ -26371,6 +26371,35 @@
     "pol_vesting": [
       {
         "function_v0": {
+          "doc": "Halt governance-gated mutations (create, change, revoke). Governance only.\\n\\n`release` and every view remain open so beneficiaries can always\\nwithdraw vested tokens (\"principal is never trapped\"). Mirrors\\n`incentive_campaigns::pause` / `staking::pause`.",
+          "inputs": [
+            {
+              "doc": "",
+              "name": "governance",
+              "type_": "address"
+            }
+          ],
+          "name": "pause",
+          "outputs": [
+            {
+              "result": {
+                "error_type": {
+                  "udt": {
+                    "name": "VestingError"
+                  }
+                },
+                "ok_type": {
+                  "tuple": {
+                    "value_types": []
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "function_v0": {
           "doc": "Release all currently vested (but unreleased) LP tokens to the beneficiary.",
           "inputs": [
             {
@@ -26394,6 +26423,35 @@
                   }
                 },
                 "ok_type": "i128"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "function_v0": {
+          "doc": "Resume governance-gated mutations. Governance only.",
+          "inputs": [
+            {
+              "doc": "",
+              "name": "governance",
+              "type_": "address"
+            }
+          ],
+          "name": "unpause",
+          "outputs": [
+            {
+              "result": {
+                "error_type": {
+                  "udt": {
+                    "name": "VestingError"
+                  }
+                },
+                "ok_type": {
+                  "tuple": {
+                    "value_types": []
+                  }
+                }
               }
             }
           ]
@@ -26454,6 +26512,16 @@
         }
       },
       {
+        "function_v0": {
+          "doc": "Return whether the contract is currently paused.",
+          "inputs": [],
+          "name": "is_paused",
+          "outputs": [
+            "bool"
+          ]
+        }
+      },
+      {
         "udt_union_v0": {
           "cases": [
             {
@@ -26478,6 +26546,12 @@
               "void_v0": {
                 "doc": "Pending treasury nominee for two-step treasury rotation.",
                 "name": "PendingTreasury"
+              }
+            },
+            {
+              "void_v0": {
+                "doc": "Contract-wide pause flag. Set by `pause`, cleared by `unpause`.",
+                "name": "Paused"
               }
             },
             {
@@ -26508,7 +26582,7 @@
                 ]
               }
             },
-              {
+            {
               "tuple_v0": {
                 "doc": "Live schedule ids for a beneficiary, in creation order. Maintained by\\n`create_vesting`, `change_beneficiary` and `revoke_vesting` so the exact\\nset of schedules can be enumerated without gaps.",
                 "name": "SchedulesOf",
@@ -26516,14 +26590,9 @@
                   "address"
                 ]
               }
-            },
-            {
-              "void_v0": {
-                "doc": "Contract-wide pause flag. Set by `pause`, cleared by `unpause`.",
-                "name": "Paused"
-              }
             }
-          ],          "doc": "",
+          ],
+          "doc": "",
           "lib": "",
           "name": "DataKey"
         }
@@ -26917,7 +26986,7 @@
               "name": "TooManySchedules",
               "value": 12
             },
-                {
+            {
               "doc": "`lp_token` is not an LP token administered by `pool`, or is not an LP\\ntoken at all.",
               "name": "LpTokenMismatch",
               "value": 13

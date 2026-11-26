@@ -168,7 +168,6 @@ impl PolVestingContract {
         Self::extend_ttl(&env);
         governance.require_auth();
         Self::require_governance(&env, &governance)?;
-
         env.deployer()
             .update_current_contract_wasm(new_wasm_hash.clone());
         soroban_amm_sdk::emit_versioned_event!(
@@ -1313,6 +1312,51 @@ mod tests {
             .unwrap_err()
             .unwrap();
         assert_eq!(err, VestingError::NotGovernance, "revoke_vesting");
+    }
+
+    #[test]
+    fn pause_requires_governance_auth() {
+        let s = setup();
+        assert_requires_auth(
+            &s.env,
+            &s.contract_id,
+            &s.governance,
+            "pause",
+            (s.governance.clone(),),
+        );
+        let client = PolVestingContractClient::new(&s.env, &s.contract_id);
+        assert!(client.is_paused());
+
+        // A stranger that does sign is still not the stored governance.
+        s.env.mock_all_auths();
+        client.unpause(&s.governance);
+        let stranger = Address::generate(&s.env);
+        let err = client.try_pause(&stranger).unwrap_err().unwrap();
+        assert_eq!(err, VestingError::NotGovernance, "pause");
+        assert!(!client.is_paused());
+    }
+
+    #[test]
+    fn unpause_requires_governance_auth() {
+        let s = setup();
+        let client = PolVestingContractClient::new(&s.env, &s.contract_id);
+        client.pause(&s.governance);
+        assert_requires_auth(
+            &s.env,
+            &s.contract_id,
+            &s.governance,
+            "unpause",
+            (s.governance.clone(),),
+        );
+        assert!(!client.is_paused());
+
+        // A stranger that does sign is still not the stored governance.
+        s.env.mock_all_auths();
+        client.pause(&s.governance);
+        let stranger = Address::generate(&s.env);
+        let err = client.try_unpause(&stranger).unwrap_err().unwrap();
+        assert_eq!(err, VestingError::NotGovernance, "unpause");
+        assert!(client.is_paused());
     }
 
     #[test]
@@ -2672,16 +2716,6 @@ mod tests {
         // Beneficiary claims the remaining 400_000, committed drops to 0
         client.release(&s.beneficiary, &id);
         assert_eq!(client.committed(&s.lp_token), 0);
-    }
-    #[test]
-    fn test_pause_requires_governance_auth() {
-        let s = setup();
-        let client = PolVestingContractClient::new(&s.env, &s.contract_id);
-        let rando = Address::generate(&s.env);
-
-        let err = client.try_pause(&rando).unwrap_err().unwrap();
-        assert_eq!(err, VestingError::NotGovernance);
-        assert!(!client.is_paused());
     }
 
     #[test]
