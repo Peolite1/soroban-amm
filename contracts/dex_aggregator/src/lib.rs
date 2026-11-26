@@ -1468,8 +1468,7 @@ mod tests {
         let cl_pool = Address::generate(&v.env);
 
         // fee_bps = 10_000 must be rejected
-        let result = agg
-            .try_register_cl_pool(&cl_pool, &v.token_a, &v.token_b, &10_000_i128);
+        let result = agg.try_register_cl_pool(&cl_pool, &v.token_a, &v.token_b, &10_000_i128);
         assert_eq!(
             result,
             Err(Ok(AggregatorError::InvalidFeeBps)),
@@ -1490,20 +1489,12 @@ mod tests {
         let cl_pool_9999 = Address::generate(&v.env);
 
         // fee_bps = 0 must be accepted
-        let result = agg
-            .try_register_cl_pool(&cl_pool_zero, &v.token_a, &v.token_b, &0_i128);
-        assert!(
-            result.is_ok(),
-            "fee_bps = 0 must be accepted"
-        );
+        let result = agg.try_register_cl_pool(&cl_pool_zero, &v.token_a, &v.token_b, &0_i128);
+        assert!(result.is_ok(), "fee_bps = 0 must be accepted");
 
         // fee_bps = 9_999 must be accepted
-        let result = agg
-            .try_register_cl_pool(&cl_pool_9999, &v.token_a, &v.token_b, &9_999_i128);
-        assert!(
-            result.is_ok(),
-            "fee_bps = 9_999 must be accepted"
-        );
+        let result = agg.try_register_cl_pool(&cl_pool_9999, &v.token_a, &v.token_b, &9_999_i128);
+        assert!(result.is_ok(), "fee_bps = 9_999 must be accepted");
 
         // Both must have emitted cl_reg exactly once each.
         assert_eq!(
@@ -1528,8 +1519,7 @@ mod tests {
         );
 
         // Re-registering the same pool with a different (even invalid) fee is a no-op.
-        let result = agg
-            .try_register_cl_pool(&cl_pool, &v.token_a, &v.token_b, &-1_i128);
+        let result = agg.try_register_cl_pool(&cl_pool, &v.token_a, &v.token_b, &-1_i128);
         assert!(
             result.is_ok(),
             "re-registering an existing pool is a no-op regardless of fee"
