@@ -556,6 +556,7 @@ proptest! {
 #[cfg(test)]
 mod contract_props {
     use super::*;
+    use soroban_sdk::testutils::Ledger as _;
     use soroban_sdk::token::TokenClient as StellarTokenClient;
 
     /// Read the pool's current token-A and token-B balances (= reserves) using
