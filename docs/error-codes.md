@@ -193,6 +193,7 @@ Defined in [contracts/batch_router/src/lib.rs](../contracts/batch_router/src/lib
 | 15 | `Paused` | The router is paused by its admin; returned by `execute_batch`, `simulate_batch` and `validate_batch` alike. | Wait for the admin to call `unpause`. |
 | 16 | `PoolDrained` | The target AMM pool is in terminal drained state (or has empty reserves in simulation), so swap/liquidity simulation refuses to quote it. | Treat the pool as retired; route to a different pool. |
 | 17 | `InvalidFactory` | The `factory` address passed to `initialize` does not implement the factory interface (the `try_get_pool_count` probe failed). No storage is written. | Pass the address of a deployed, initialized factory contract; a rejected `initialize` leaves the router uninitialized, so it can be retried. |
+| 18 | `InvalidToken` | A CL `SwapOp` named a `token_in` the pool does not trade, or a `zero_for_one` direction contradicted by that token. Returned by `execute_batch`, `simulate_batch` and `validate_batch` alike. | Use one of the pool's tokens and set `zero_for_one = true` for token A, `false` for token B. |
 
 Current simulation note: `batch_router::simulate_batch` still does not replay AMM circuit-breaker and oracle-deviation checks, so those AMM guards can still diverge between simulation and execution.
 
@@ -257,7 +258,8 @@ Defined in [contracts/dex_aggregator/src/lib.rs](../contracts/dex_aggregator/src
 | 5 | `TooManyRoutingTokens` | `set_routing_tokens` called with more than `MAX_ROUTING_TOKENS` addresses. | Reduce the routing token list size. |
 | 6 | `NotInitialized` | An admin setter, quote, swap, `get_admin`/`get_factory`, `pause`/`unpause`, `propose_admin`, `upgrade` was called before `initialize`, or `accept_admin` was called without a pending nomination. | Call `initialize` (or `propose_admin` before `accept_admin`) first. |
 | 7 | `Paused` | A state-mutating entrypoint (`set_max_hops`, `register_cl_pool`, `set_routing_tokens`, `remove_cl_pool`, `execute_route`, `swap_best`) was called while the aggregator is paused. Quotes (`find_best_route`, `get_quote`, `is_price_within_tolerance`) stay callable. | Wait for the admin to call `unpause`; check `is_paused` first. |
-| 8 | `Unauthorized` | `pause`, `unpause`, `propose_admin`, `accept_admin`, or `upgrade` was called with an address that does not match the stored admin or pending nominee. | Pass the stored admin (or nominated pending admin for `accept_admin`) and sign with its key. |
+| 8 | `Unauthorized` | `pause` or `unpause` was called with an `admin` address that does not match the stored admin. | Pass the stored admin address and sign with its key. |
+| 9 | `InvalidFeeBps` | `register_cl_pool` was called with a `fee_bps` outside `[0, 10 000)`. | Use a fee in `0..=9 999`, mirroring the factory's validation. |
 
 ---
 

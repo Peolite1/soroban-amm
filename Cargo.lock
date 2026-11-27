@@ -940,6 +940,7 @@ name = "incentive_campaigns"
 version = "0.1.0"
 dependencies = [
  "amm",
+ "proptest",
  "soroban-sdk",
  "soroban_amm_sdk",
  "token",

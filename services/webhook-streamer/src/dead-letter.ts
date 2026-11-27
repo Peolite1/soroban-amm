@@ -11,6 +11,7 @@
  * permanently-broken subscriber cannot exhaust memory.
  */
 
+import type { Logger } from "./rpc-poller.js";
 import { MemoryStateStore, type StateStore } from "./storage.js";
 import type {
   AttemptOutcome,
@@ -30,6 +31,7 @@ export function _resetDeadLetterIds(): void {
 
 export class DeadLetterQueue {
   private entries: DeadLetter[] = [];
+  private evictionCount = 0;
   readonly maxEntries: number;
 
   /**
@@ -39,6 +41,7 @@ export class DeadLetterQueue {
   constructor(
     maxEntries: number = DEFAULT_MAX_ENTRIES,
     private readonly store: StateStore = new MemoryStateStore(),
+    private readonly logger: Logger = console,
   ) {
     if (!Number.isFinite(maxEntries) || maxEntries < 1) {
       throw new RangeError("maxEntries must be a positive integer");
@@ -46,8 +49,24 @@ export class DeadLetterQueue {
     this.maxEntries = Math.floor(maxEntries);
 
     const saved = store.loadDeadLetters();
-    this.entries = saved.entries.slice(-this.maxEntries);
+    this.entries = saved.entries;
     _nextId = Math.max(_nextId, saved.nextId);
+    while (this.entries.length > this.maxEntries) {
+      this.evictOldest("on load");
+    }
+    if (this.evictionCount > 0) this.persist();
+  }
+
+  private evictOldest(when: string): void {
+    const evicted = this.entries.shift();
+    if (!evicted) return;
+    this.evictionCount += 1;
+    this.logger.warn(
+      `[dead-letter] evicted oldest entry deadLetterId=${evicted.id} ` +
+        `event=${evicted.event.id} subscription=${evicted.subscription.id} ` +
+        `reason="${evicted.reason}" when=${when} ` +
+        `maxEntries=${this.maxEntries} evictions=${this.evictionCount}`,
+    );
   }
 
   /**
@@ -58,7 +77,7 @@ export class DeadLetterQueue {
     try {
       this.store.saveDeadLetters({ entries: this.entries, nextId: _nextId });
     } catch (err) {
-      console.error("[dead-letter] failed to persist the queue:", err);
+      this.logger.error("[dead-letter] failed to persist the queue:", err);
     }
   }
 
@@ -87,7 +106,7 @@ export class DeadLetterQueue {
     this.entries.push(entry);
     // Bounded: drop oldest-first once over capacity.
     while (this.entries.length > this.maxEntries) {
-      this.entries.shift();
+      this.evictOldest("at capacity");
     }
     this.persist();
     return entry;
@@ -131,6 +150,14 @@ export class DeadLetterQueue {
 
   get size(): number {
     return this.entries.length;
+  }
+
+  get evictions(): number {
+    return this.evictionCount;
+  }
+
+  resetEvictions(): void {
+    this.evictionCount = 0;
   }
 }
 

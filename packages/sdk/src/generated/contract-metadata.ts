@@ -757,7 +757,8 @@ export const CONTRACT_METADATA = {
       "5": "TooManyRoutingTokens",
       "6": "NotInitialized",
       "7": "Paused",
-      "8": "Unauthorized"
+      "8": "Unauthorized",
+      "9": "InvalidFeeBps"
     },
     "structs": {
       "PriceImpactEstimate": [

@@ -6214,7 +6214,7 @@
               "type_": "address"
             },
             {
-              "doc": "Swap direction for concentrated-liquidity venues: `true` swaps token A\\nfor token B (price decreasing). Unused for `PoolType::Amm`.",
+              "doc": "Swap direction for concentrated-liquidity venues: `true` swaps token A\\nfor token B (price decreasing), so `token_in` must be token A; `false`\\nrequires `token_in` to be token B. Unused for `PoolType::Amm`.",
               "name": "zero_for_one",
               "type_": "bool"
             }
@@ -6781,6 +6781,11 @@
               "doc": "The address passed to `initialize` as `factory` does not implement the\\nfactory interface. Rejected at deploy time so a mistyped address cannot\\nturn every later batch into an untyped host trap.",
               "name": "InvalidFactory",
               "value": 17
+            },
+            {
+              "doc": "A CL swap's `token_in` is not one of the pool's tokens, or\\n`zero_for_one` contradicts it (must be `true` iff selling token A).",
+              "name": "InvalidToken",
+              "value": 18
             }
           ],
           "doc": "Errors returned by [`BatchRouter`] entry points.\\n\\nSee `docs/error-codes.md` for the full description of each variant.",
@@ -14261,6 +14266,11 @@
               "doc": "An admin- or nominee-gated entrypoint (`pause`, `unpause`,\\n`propose_admin`, `accept_admin`, `upgrade`) was called with an\\naddress that does not match the stored admin or pending nominee.",
               "name": "Unauthorized",
               "value": 8
+            },
+            {
+              "doc": "`register_cl_pool` was called with a `fee_bps` outside `[0, 10 000)`.",
+              "name": "InvalidFeeBps",
+              "value": 9
             }
           ],
           "doc": "",
