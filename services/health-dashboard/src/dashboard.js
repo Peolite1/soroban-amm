@@ -207,7 +207,21 @@ export function renderPoolsOverview(stats) {
     const tvlDisplay = pool.tvl === null ? "—" : formatMetricWithUnit(pool.tvl, "tokens");
     const volDisplay = pool.volume24h === null ? "—" : formatMetricWithUnit(pool.volume24h, "tokens");
     const feesDisplay = pool.fees24h === null ? "—" : formatMetricWithUnit(pool.fees24h, "tokens");
-    row.innerHTML = `<td>${pool.poolId}</td><td>${pool.tokenA}</td><td>${pool.tokenB}</td><td>${tvlDisplay}</td><td>${volDisplay}</td><td>${feesDisplay}</td><td>${Number(pool.swapCount).toLocaleString()}</td><td>${pool.priceDeviationBps} bps</td>`;
+    const values = [
+      pool.poolId,
+      pool.tokenA,
+      pool.tokenB,
+      tvlDisplay,
+      volDisplay,
+      feesDisplay,
+      Number(pool.swapCount).toLocaleString(),
+      `${pool.priceDeviationBps} bps`,
+    ];
+    for (const value of values) {
+      const cell = document.createElement("td");
+      cell.textContent = String(value);
+      row.appendChild(cell);
+    }
     tbody.appendChild(row);
   }
   table.appendChild(tbody);
