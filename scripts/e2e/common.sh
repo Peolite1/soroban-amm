@@ -561,6 +561,64 @@ e2e_wait_until() {
   fi
 }
 
+# e2e_ledger_time — close time (unix seconds) of the network's latest closed
+# ledger: the clock contracts read as env.ledger().timestamp(). Asks RPC for
+# the latest sequence (getLatestLedger), then for that ledger (getLedgers),
+# falling back one ledger when the load-balanced node that answers the second
+# call has not closed it yet. Prints nothing and fails if it cannot be read.
+#
+# To wait for on-chain time to pass, use this rather than a timestamp a
+# contract stores. An AMM pool's get_liquidity_cumulative() and
+# get_price_cumulative() report the time of the pool's last state-changing
+# call; reads never advance it, so polling it while nothing writes to the pool
+# waits forever (issue #1488).
+e2e_ledger_time() {
+  local seq candidate ts
+  seq=$(stellar ledger latest --network "$NETWORK" --output json 2>/dev/null | json_num sequence) \
+    || return 1
+  [[ "$seq" =~ ^[0-9]+$ ]] || return 1
+  for candidate in "$seq" "$(( seq - 1 ))"; do
+    # The close time is a plain field of each ledger; --xdr-format xdr keeps
+    # the CLI from decoding the header and metadata into a larger response.
+    ts=$(stellar ledger fetch "$candidate" --network "$NETWORK" --output json --xdr-format xdr 2>/dev/null \
+      | grep -Eo '"ledgerCloseTime"[[:space:]]*:[[:space:]]*"?[0-9]+' \
+      | grep -Eo '[0-9]+$' | tail -n 1) || ts=""
+    if [[ -n "$ts" ]]; then
+      printf '%s\n' "$ts"
+      return 0
+    fi
+  done
+  return 1
+}
+
+E2E_LEDGER_WAIT_SECS="${E2E_LEDGER_WAIT_SECS:-240}"
+E2E_LEDGER_POLL_SECS="${E2E_LEDGER_POLL_SECS:-5}"
+
+# e2e_wait_for_ledger_time TARGET_TS — poll e2e_ledger_time until the latest
+# closed ledger closed at or after TARGET_TS, so a transaction sent next is
+# applied no earlier than TARGET_TS. Fails after E2E_LEDGER_WAIT_SECS (default
+# 240) with the last close time it read. A ledger closes every ~5s on testnet,
+# so a target a minute out is reached long before that.
+e2e_wait_for_ledger_time() {
+  local target="$1" ts="" now_ts deadline
+  deadline=$(( $(date +%s) + E2E_LEDGER_WAIT_SECS ))
+  while :; do
+    if now_ts=$(e2e_ledger_time); then
+      ts="$now_ts"
+      if (( ts >= target )); then
+        return 0
+      fi
+    fi
+    if (( $(date +%s) >= deadline )); then
+      if [[ -z "$ts" ]]; then
+        die "e2e_wait_for_ledger_time: could not read the latest ledger close time from RPC in ${E2E_LEDGER_WAIT_SECS}s, waited for $target"
+      fi
+      die "e2e_wait_for_ledger_time: ledger clock at $ts after ${E2E_LEDGER_WAIT_SECS}s, waited for $target"
+    fi
+    sleep "$E2E_LEDGER_POLL_SECS"
+  done
+}
+
 balance_of() {
   invoke "$1" balance --id "$2" | parse_i128
 }

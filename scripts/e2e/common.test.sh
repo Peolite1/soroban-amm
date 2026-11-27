@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# common.test.sh — offline tests for the assertion helpers in common.sh.
-# No network: reads are stubbed. Run: bash scripts/e2e/common.test.sh
+# common.test.sh — offline tests for the assertion and ledger-clock helpers in
+# common.sh. No network: reads and the stellar CLI are stubbed.
+# Run: bash scripts/e2e/common.test.sh
 set -Eeuo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -8,7 +9,8 @@ source "$HERE/common.sh"
 
 E2E_READ_WAIT_SECS=0
 COUNTER="$(mktemp)"
-trap 'rm -f "$COUNTER"' EXIT
+INVOKES="$(mktemp)"
+trap 'rm -f "$COUNTER" "$INVOKES"' EXIT
 FAILED=0
 
 # calls_until_ok N OK_VALUE STALE_VALUE — prints STALE_VALUE for the first N-1
@@ -84,5 +86,110 @@ expect_ok "deferred code sees caller locals" local_scope
 
 # a failing deferred command counts as an empty read, not a crash
 expect_die "failing command dies via the assertion" assert_eq "t" '@cmd:false' "x"
+
+# ── ledger clock (issue #1488) ──────────────────────────────────────────────
+# e2e_wait_for_ledger_time must wait on the network's ledger close time. The
+# twal_consumer flow used to poll the AMM pool's get_liquidity_cumulative()
+# timestamp instead, which is the time of the pool's last write: nothing wrote
+# to the pool while the flow waited, so it sat at the deposit's ledger and
+# every testnet run timed out with "pool clock stuck".
+
+# stellar — offline stand-in for the CLI. `ledger latest` reports sequence
+# STUB_SEQ; each `ledger fetch` (counted in $COUNTER) reports a close time
+# STUB_STEP seconds later than the previous one, starting at STUB_CLOSE.
+# STUB_FETCH_FAIL=1 fails every fetch; STUB_LAG=1 fails the fetch of STUB_SEQ
+# only, like a load-balanced node a ledger behind. `contract invoke` is logged
+# to $INVOKES and returns a pool clock that never moves.
+STUB_SEQ=100
+STUB_CLOSE=1795524937
+STUB_STEP=5
+STUB_FETCH_FAIL=0
+STUB_LAG=0
+stellar() {
+  case "$1 $2" in
+    "ledger latest")
+      printf '{"id":"ab12","protocolVersion":23,"sequence":%s}\n' "$STUB_SEQ"
+      ;;
+    "ledger fetch")
+      local seq="$3" n close
+      if [[ "$STUB_FETCH_FAIL" == 1 ]]; then echo "error: RPC unavailable" >&2; return 1; fi
+      if [[ "$STUB_LAG" == 1 && "$seq" == "$STUB_SEQ" ]]; then
+        echo "error: start ledger must be between the oldest and latest ledger" >&2
+        return 1
+      fi
+      n=$(cat "$COUNTER"); echo $(( n + 1 )) > "$COUNTER"
+      close=$(( STUB_CLOSE + n * STUB_STEP ))
+      # latestLedgerCloseTime is deliberately different: the helper must
+      # report the close time of the ledger it asked for.
+      printf '{"ledgers":[{"hash":"cd34","sequence":%s,"ledgerCloseTime":"%s","headerXdr":"AAAA","metadataXdr":"AAAA"}],"latestLedger":%s,"latestLedgerCloseTime":"%s","oldestLedger":1,"oldestLedgerCloseTime":"1","cursor":"%s"}\n' \
+        "$seq" "$close" "$STUB_SEQ" "$(( close + 999 ))" "$seq"
+      ;;
+    "contract invoke")
+      echo invoke >> "$INVOKES"
+      printf '["0","%s"]\n' "$STUB_CLOSE"
+      ;;
+    *)
+      echo "stellar stub: unexpected call: $*" >&2
+      return 1
+      ;;
+  esac
+}
+
+expect_out() {
+  local name="$1" want="$2" got
+  shift 2
+  echo 0 > "$COUNTER"
+  got=$( "$@" 2>/dev/null ) || got="<failed>"
+  if [[ "$got" == "$want" ]]; then echo "ok   - $name"; else echo "FAIL - $name: got '$got', wanted '$want'"; FAILED=1; fi
+}
+
+# expect_die_with NAME PATTERN CMD... — CMD must fail and say PATTERN on stderr.
+expect_die_with() {
+  local name="$1" pattern="$2" err
+  shift 2
+  echo 0 > "$COUNTER"
+  if err=$( ( "$@" ) 2>&1 >/dev/null ); then
+    echo "FAIL - $name (should have failed)"; FAILED=1
+  elif [[ "$err" == *"$pattern"* ]]; then
+    echo "ok   - $name"
+  else
+    echo "FAIL - $name: stderr lacks '$pattern': $err"; FAILED=1
+  fi
+}
+
+expect_out "ledger time is the fetched ledger's close time" "$STUB_CLOSE" e2e_ledger_time
+STUB_LAG=1
+expect_out "ledger time falls back a ledger when the node lags" "$STUB_CLOSE" e2e_ledger_time
+STUB_LAG=0
+STUB_FETCH_FAIL=1
+expect_die "ledger time fails when RPC cannot be read" e2e_ledger_time
+STUB_FETCH_FAIL=0
+
+E2E_LEDGER_POLL_SECS=0
+E2E_LEDGER_WAIT_SECS=30
+: > "$INVOKES"
+expect_ok "wait returns once the ledger clock reaches the target" \
+  e2e_wait_for_ledger_time $(( STUB_CLOSE + 15 ))
+expect_calls "wait polls until the target ledger closes" 4
+if [[ -s "$INVOKES" ]]; then
+  echo "FAIL - wait must not read a contract's stored timestamp ($(wc -l < "$INVOKES") invoke(s))"; FAILED=1
+else
+  echo "ok   - wait reads no contract's stored timestamp"
+fi
+expect_ok "wait returns at once when the target has passed" \
+  e2e_wait_for_ledger_time $(( STUB_CLOSE - 60 ))
+expect_calls "a passed target costs one read" 1
+
+E2E_LEDGER_WAIT_SECS=0
+STUB_STEP=0
+expect_die_with "wait dies when the ledger clock never reaches the target" \
+  "ledger clock at $STUB_CLOSE after 0s, waited for $(( STUB_CLOSE + 15 ))" \
+  e2e_wait_for_ledger_time $(( STUB_CLOSE + 15 ))
+STUB_FETCH_FAIL=1
+expect_die_with "wait dies naming RPC when the ledger time cannot be read" \
+  "could not read the latest ledger close time" \
+  e2e_wait_for_ledger_time $(( STUB_CLOSE + 15 ))
+STUB_FETCH_FAIL=0
+STUB_STEP=5
 
 exit "$FAILED"
