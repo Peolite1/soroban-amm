@@ -68,6 +68,8 @@ pub enum AggregatorError {
     /// `propose_admin`, `accept_admin`, `upgrade`) was called with an
     /// address that does not match the stored admin or pending nominee.
     Unauthorized = 8,
+    /// `register_cl_pool` was called with a `fee_bps` outside `[0, 10 000)`.
+    InvalidFeeBps = 9,
 }
 
 #[contracttype]
@@ -301,6 +303,10 @@ impl DexAggregator {
             if entry.pool == pool {
                 return Ok(());
             }
+        }
+
+        if !(0..10_000i128).contains(&fee_bps) {
+            return Err(AggregatorError::InvalidFeeBps);
         }
 
         assert!(count < Self::MAX_CL_POOLS, "max CL pools reached");
@@ -1429,6 +1435,101 @@ mod tests {
         agg.register_cl_pool(&cl_pool, &v.token_a, &v.token_b, &30_i128);
 
         assert_eq!(count_events(&v.env, &v.agg, symbol_short!("cl_reg")), 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // #1456: validate CL pool fee_bps in register_cl_pool
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_register_cl_pool_rejects_negative_fee_bps() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+        let cl_pool = Address::generate(&v.env);
+
+        let result = agg.try_register_cl_pool(&cl_pool, &v.token_a, &v.token_b, &-1_i128);
+        assert_eq!(
+            result,
+            Err(Ok(AggregatorError::InvalidFeeBps)),
+            "negative fee_bps must return InvalidFeeBps"
+        );
+        // No cl_reg event must be emitted.
+        assert_eq!(
+            count_events(&v.env, &v.agg, symbol_short!("cl_reg")),
+            0,
+            "no cl_reg event for rejected negative fee"
+        );
+    }
+
+    #[test]
+    fn test_register_cl_pool_rejects_fee_bps_at_or_above_10_000() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+        let cl_pool = Address::generate(&v.env);
+
+        // fee_bps = 10_000 must be rejected
+        let result = agg.try_register_cl_pool(&cl_pool, &v.token_a, &v.token_b, &10_000_i128);
+        assert_eq!(
+            result,
+            Err(Ok(AggregatorError::InvalidFeeBps)),
+            "fee_bps = 10_000 must return InvalidFeeBps"
+        );
+        assert_eq!(
+            count_events(&v.env, &v.agg, symbol_short!("cl_reg")),
+            0,
+            "no cl_reg event for rejected fee_bps = 10_000"
+        );
+    }
+
+    #[test]
+    fn test_register_cl_pool_accepts_fee_bps_zero_and_9999() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+        let cl_pool_zero = Address::generate(&v.env);
+        let cl_pool_9999 = Address::generate(&v.env);
+
+        // fee_bps = 0 must be accepted
+        let result = agg.try_register_cl_pool(&cl_pool_zero, &v.token_a, &v.token_b, &0_i128);
+        assert!(result.is_ok(), "fee_bps = 0 must be accepted");
+
+        // fee_bps = 9_999 must be accepted
+        let result = agg.try_register_cl_pool(&cl_pool_9999, &v.token_a, &v.token_b, &9_999_i128);
+        assert!(result.is_ok(), "fee_bps = 9_999 must be accepted");
+
+        // Both must have emitted cl_reg exactly once each.
+        assert_eq!(
+            count_events(&v.env, &v.agg, symbol_short!("cl_reg")),
+            2,
+            "one cl_reg per accepted registration"
+        );
+    }
+
+    #[test]
+    fn test_register_cl_pool_re_register_with_different_fee_is_no_op() {
+        let v = setup_venues();
+        let agg = DexAggregatorClient::new(&v.env, &v.agg);
+        let cl_pool = Address::generate(&v.env);
+
+        // First registration with a valid fee.
+        agg.register_cl_pool(&cl_pool, &v.token_a, &v.token_b, &30_i128);
+        assert_eq!(
+            count_events(&v.env, &v.agg, symbol_short!("cl_reg")),
+            1,
+            "first registration emits one cl_reg"
+        );
+
+        // Re-registering the same pool with a different (even invalid) fee is a no-op.
+        let result = agg.try_register_cl_pool(&cl_pool, &v.token_a, &v.token_b, &-1_i128);
+        assert!(
+            result.is_ok(),
+            "re-registering an existing pool is a no-op regardless of fee"
+        );
+        // No additional cl_reg event.
+        assert_eq!(
+            count_events(&v.env, &v.agg, symbol_short!("cl_reg")),
+            1,
+            "re-registering must not emit another cl_reg"
+        );
     }
 
     #[test]
