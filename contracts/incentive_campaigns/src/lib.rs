@@ -2063,6 +2063,9 @@ impl IncentiveCampaigns {
 }
 
 #[cfg(test)]
+mod guard_tests;
+
+#[cfg(test)]
 mod tests {
     extern crate std;
 
