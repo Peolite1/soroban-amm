@@ -3163,6 +3163,170 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_pause_requires_admin_signature_without_state_change() {
+        let env = Env::default();
+        let stranger = Address::generate(&env);
+        env.mock_all_auths();
+        let (client, admin) = initialized_auction(&env);
+
+        let args = Vec::from_array(&env, [admin.clone().into_val(&env)]);
+        assert_requires_auth(
+            &env,
+            &client.address,
+            &admin,
+            &stranger,
+            "pause",
+            args,
+            || {
+                assert!(
+                    !client.is_paused(),
+                    "rejected pause calls must not halt the auction"
+                );
+                client.pause(&admin);
+            },
+        );
+        assert!(client.is_paused());
+    }
+
+    #[test]
+    fn test_unpause_requires_admin_signature_without_state_change() {
+        let env = Env::default();
+        let stranger = Address::generate(&env);
+        env.mock_all_auths();
+        let (client, admin) = initialized_auction(&env);
+        client.pause(&admin);
+
+        let args = Vec::from_array(&env, [admin.clone().into_val(&env)]);
+        assert_requires_auth(
+            &env,
+            &client.address,
+            &admin,
+            &stranger,
+            "unpause",
+            args,
+            || {
+                assert!(
+                    client.is_paused(),
+                    "rejected unpause calls must leave the auction halted"
+                );
+                client.unpause(&admin);
+            },
+        );
+        assert!(!client.is_paused());
+    }
+
+    /// The executable (WASM hash, or the built-in marker for a natively
+    /// registered test contract) recorded in `contract_id`'s instance entry.
+    fn contract_executable(
+        env: &Env,
+        contract_id: &Address,
+    ) -> soroban_sdk::xdr::ContractExecutable {
+        use soroban_sdk::xdr::{LedgerEntryData, LedgerKey, ScAddress, ScVal};
+
+        let contract_address = ScAddress::from(contract_id);
+        env.to_ledger_snapshot()
+            .ledger_entries
+            .into_iter()
+            .find_map(|(key, (entry, _))| match (*key, entry.data) {
+                (LedgerKey::ContractData(key), LedgerEntryData::ContractData(data))
+                    if key.contract == contract_address
+                        && key.key == ScVal::LedgerKeyContractInstance =>
+                {
+                    match data.val {
+                        ScVal::ContractInstance(instance) => Some(instance.executable),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .expect("batch auction contract instance must exist")
+    }
+
+    #[test]
+    fn test_upgrade_requires_admin_signature_without_state_change() {
+        let env = Env::default();
+        let stranger = Address::generate(&env);
+        env.mock_all_auths();
+        let (client, admin) = initialized_auction(&env);
+        // Upload real WASM so an unsigned upgrade would actually replace the
+        // code if the signature check were missing, instead of failing on an
+        // unknown hash.
+        let wasm = soroban_sdk::Bytes::from_slice(
+            &env,
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../target/wasm32v1-none/release/batch_auction.wasm"
+            )),
+        );
+        let hash = env.deployer().upload_contract_wasm(wasm);
+        let executable_before = contract_executable(&env, &client.address);
+
+        let args = Vec::from_array(
+            &env,
+            [admin.clone().into_val(&env), hash.clone().into_val(&env)],
+        );
+        assert_requires_auth(
+            &env,
+            &client.address,
+            &admin,
+            &stranger,
+            "upgrade",
+            args,
+            || {
+                assert_eq!(
+                    contract_executable(&env, &client.address),
+                    executable_before,
+                    "rejected upgrade calls must not replace the contract code"
+                );
+                client.upgrade(&admin, &hash);
+            },
+        );
+        assert_ne!(
+            contract_executable(&env, &client.address),
+            executable_before
+        );
+    }
+
+    #[test]
+    fn test_set_window_bounds_requires_admin_signature_without_state_change() {
+        let env = Env::default();
+        let stranger = Address::generate(&env);
+        env.mock_all_auths();
+        let (client, admin) = initialized_auction(&env);
+        let bounds_before = client.get_window_bounds();
+        assert_eq!(
+            bounds_before,
+            (MIN_BATCH_WINDOW_SECS, MAX_BATCH_WINDOW_SECS)
+        );
+
+        let args = Vec::from_array(
+            &env,
+            [
+                admin.clone().into_val(&env),
+                10_u64.into_val(&env),
+                600_u64.into_val(&env),
+            ],
+        );
+        assert_requires_auth(
+            &env,
+            &client.address,
+            &admin,
+            &stranger,
+            "set_window_bounds",
+            args,
+            || {
+                assert_eq!(
+                    client.get_window_bounds(),
+                    bounds_before,
+                    "rejected set_window_bounds calls must not change the bounds"
+                );
+                client.set_window_bounds(&admin, &10_u64, &600_u64);
+            },
+        );
+        assert_eq!(client.get_window_bounds(), (10, 600));
+    }
+
     // ── Issue #553: two-step admin rotation ─────────────────────────────────────
 
     #[test]

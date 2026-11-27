@@ -10,6 +10,8 @@
 //! 3. `quote_single_token_deposit` vs `mint_position_single_token`: full 3x2
 //!    parity table over `(tick below / inside / above range) x (token A / B)`,
 //!    explicitly exercising both wrong-side `SlippageExceeded` guards.
+//! 4. `modify_position` while paused -> `ClError::Paused` with full state
+//!    preservation.
 
 use soroban_sdk::testutils::Address as _;
 use soroban_sdk::token::{Client as TokenClient, StellarAssetClient};
@@ -116,6 +118,7 @@ fn assert_snapshot_unchanged(before: &PoolSnapshot, after: &PoolSnapshot) {
 
 struct TestPool<'a> {
     contract_id: Address,
+    admin: Address,
     provider: Address,
     trader: Address,
     token_a: Address,
@@ -171,6 +174,7 @@ fn setup_pool(env: &Env, initial_tick: i32, with_liquidity: bool) -> TestPool<'_
 
     TestPool {
         contract_id,
+        admin,
         provider,
         trader,
         token_a,
@@ -706,6 +710,62 @@ fn modify_position_negative_liquidity_delta_rejected_and_preserves_state() {
         pos_before,
         pool.client
             .get_position(&pool.provider, &RANGE_LOWER, &RANGE_UPPER)
+    );
+}
+
+#[test]
+fn modify_position_rejected_while_paused_and_preserves_state() {
+    let env = Env::default();
+    let pool = setup_pool(&env, 0, true);
+    pool.client.pause(&pool.admin);
+    let before = snapshot_pool(
+        &env,
+        &pool.contract_id,
+        &pool.client,
+        &pool.token_a,
+        &pool.token_b,
+        &pool.provider,
+    );
+    let pos_before = pool
+        .client
+        .get_position(&pool.provider, &RANGE_LOWER, &RANGE_UPPER);
+
+    let res = pool.client.try_modify_position(
+        &pool.provider,
+        &RANGE_LOWER,
+        &RANGE_UPPER,
+        &MODIFY_LIQUIDITY_DELTA,
+        &0_i128,
+        &0_i128,
+        &u64::MAX,
+    );
+    assert_eq!(res, Err(Ok(ClError::Paused)));
+
+    let after = snapshot_pool(
+        &env,
+        &pool.contract_id,
+        &pool.client,
+        &pool.token_a,
+        &pool.token_b,
+        &pool.provider,
+    );
+    assert_snapshot_unchanged(&before, &after);
+    assert_eq!(
+        pos_before,
+        pool.client
+            .get_position(&pool.provider, &RANGE_LOWER, &RANGE_UPPER)
+    );
+
+    // The same call goes through once the pool is unpaused.
+    pool.client.unpause(&pool.admin);
+    pool.client.modify_position(
+        &pool.provider,
+        &RANGE_LOWER,
+        &RANGE_UPPER,
+        &MODIFY_LIQUIDITY_DELTA,
+        &0_i128,
+        &0_i128,
+        &u64::MAX,
     );
 }
 

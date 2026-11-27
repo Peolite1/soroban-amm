@@ -13,6 +13,7 @@ extern crate std;
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, MockAuth, MockAuthInvoke},
+    xdr::{ContractExecutable, Hash, LedgerEntryData, LedgerKey, ScAddress, ScVal},
     Address, Env, IntoVal, Symbol, Val,
 };
 
@@ -214,16 +215,60 @@ fn test_accept_admin_requires_nominee_auth() {
     assert_eq!(f.client().get_admin(), nominee);
 }
 
+/// The executable (WASM hash, or the built-in marker for a natively
+/// registered test contract) recorded in the contract's instance entry.
+fn contract_executable(env: &Env, contract_id: &Address) -> ContractExecutable {
+    let contract_address = ScAddress::from(contract_id);
+    env.to_ledger_snapshot()
+        .ledger_entries
+        .into_iter()
+        .find_map(|(key, (entry, _))| match (*key, entry.data) {
+            (LedgerKey::ContractData(key), LedgerEntryData::ContractData(data))
+                if key.contract == contract_address
+                    && key.key == ScVal::LedgerKeyContractInstance =>
+            {
+                match data.val {
+                    ScVal::ContractInstance(instance) => Some(instance.executable),
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .expect("governance contract instance must exist")
+}
+
+fn upload_governance_wasm(env: &Env) -> soroban_sdk::BytesN<32> {
+    let wasm = soroban_sdk::Bytes::from_slice(env, &std::fs::read(WASM_PATH).unwrap());
+    env.deployer().upload_contract_wasm(wasm)
+}
+
 #[test]
 fn test_upgrade_requires_admin_auth() {
     let f = Fixture::new();
-    let wasm = soroban_sdk::Bytes::from_slice(&f.env, &std::fs::read(WASM_PATH).unwrap());
-    let hash = f.env.deployer().upload_contract_wasm(wasm);
-    f.check(&f.admin, "upgrade", (f.admin.clone(), hash.clone()));
+    let hash = upload_governance_wasm(&f.env);
+    f.check(&f.admin, "upgrade", (f.admin.clone(), hash));
+}
+
+/// Runs against the natively registered contract, before any upgrade: once
+/// `upgrade` succeeds the contract executes the prebuilt WASM instead of this
+/// crate's source, so a check placed after it would not test the source.
+#[test]
+fn test_upgrade_rejects_stranger_as_admin_without_code_change() {
+    let f = Fixture::new();
+    let hash = upload_governance_wasm(&f.env);
     let stranger = Address::generate(&f.env);
+    let executable_before = contract_executable(&f.env, &f.addr);
+    // Sanity check: a successful upgrade would change the executable.
+    assert_ne!(
+        executable_before,
+        ContractExecutable::Wasm(Hash(hash.to_array()))
+    );
+
     f.env.mock_all_auths();
     assert_eq!(
         f.client().try_upgrade(&stranger, &hash),
         Err(Ok(GovernanceError::Unauthorized))
     );
+    assert_eq!(contract_executable(&f.env, &f.addr), executable_before);
+    assert_eq!(f.client().get_admin(), f.admin);
 }

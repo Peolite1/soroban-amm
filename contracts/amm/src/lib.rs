@@ -3775,6 +3775,13 @@ pub(crate) mod tests;
 #[cfg(test)]
 mod guard_tests;
 
+// Non-positive amount and multisig emergency-withdraw guards (#1576).
+#[cfg(test)]
+mod amount_guard_tests;
+
+#[cfg(test)]
+mod multisig_guard_tests;
+
 // ── Authorization regression tests for admin entrypoints ─────────────────────
 
 #[cfg(test)]

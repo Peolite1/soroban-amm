@@ -158,6 +158,15 @@ fn test_unpause_requires_admin_auth() {
     // `Fixture::new` leaves `mock_all_auths` active.
     let f = Fixture::new();
     f.client.pause(&f.admin);
+
+    // A stranger passed as admin is rejected and the pool stays paused.
+    let stranger = Address::generate(f.env());
+    assert_eq!(
+        f.client.try_unpause(&stranger),
+        Err(Ok(ClError::Unauthorized))
+    );
+    assert!(f.client.is_paused());
+
     f.check(&f.admin, "unpause", (f.admin.clone(),));
     assert!(!f.client.is_paused());
 }
