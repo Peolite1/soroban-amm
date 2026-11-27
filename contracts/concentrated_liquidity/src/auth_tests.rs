@@ -13,14 +13,13 @@ extern crate std;
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke},
+    testutils::{Address as _, MockAuth, MockAuthInvoke},
     Address, Env, IntoVal, Symbol, Val,
 };
-use soroban_sdk::token::StellarAssetClient;
 
-#[cfg(feature = "testutils")]
-use super::WASM as CL_WASM;
-#[cfg(not(feature = "testutils"))]
+// `crate::WASM` exists only with the crate's `testutils` feature, which a plain
+// `cargo test -p concentrated_liquidity` does not enable. Include the built
+// artifact directly so the `upgrade` tests run either way.
 const CL_WASM: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../target/wasm32v1-none/release/concentrated_liquidity.wasm"
@@ -52,7 +51,8 @@ fn invoke_catching(env: &Env, invoke: &MockAuthInvoke) -> Result<(), std::string
 fn assert_auth_err(env: &Env, invoke: &MockAuthInvoke, context: &str) {
     let msg = invoke_catching(env, invoke).expect_err(&std::format!(
         "{} should fail under {}",
-        invoke.fn_name, context
+        invoke.fn_name,
+        context
     ));
     assert!(
         msg.contains("Error(Auth, InvalidAction)"),
@@ -99,8 +99,6 @@ struct Fixture {
     admin: Address,
     cl_addr: Address,
     client: ConcentratedLiquidityClient<'static>,
-    token_a: Address,
-    token_b: Address,
 }
 
 impl Fixture {
@@ -110,7 +108,6 @@ impl Fixture {
         env.mock_all_auths();
 
         let admin = Address::generate(&env);
-        let provider = Address::generate(&env);
 
         let token_a_sac = env.register_stellar_asset_contract_v2(admin.clone());
         let token_b_sac = env.register_stellar_asset_contract_v2(admin.clone());
@@ -121,19 +118,11 @@ impl Fixture {
         let client = ConcentratedLiquidityClient::new(&env, &cl_addr);
         client.initialize(&admin, &token_a, &token_b, &30_i128, &0_i32, &1_i32);
 
-        // Mint tokens for testing
-        let sac_a = StellarAssetClient::new(&env, &token_a);
-        let sac_b = StellarAssetClient::new(&env, &token_b);
-        sac_a.mint(&provider, &10_000_000_i128);
-        sac_b.mint(&provider, &10_000_000_i128);
-
         Self {
             env,
             admin,
             cl_addr,
             client,
-            token_a,
-            token_b,
         }
     }
 
@@ -166,8 +155,8 @@ fn test_pause_requires_admin_auth() {
 
 #[test]
 fn test_unpause_requires_admin_auth() {
+    // `Fixture::new` leaves `mock_all_auths` active.
     let f = Fixture::new();
-    f.env().mock_all_auths();
     f.client.pause(&f.admin);
     f.check(&f.admin, "unpause", (f.admin.clone(),));
     assert!(!f.client.is_paused());
@@ -181,7 +170,7 @@ fn test_set_oracle_requires_admin_auth() {
         "set_oracle",
         (f.admin.clone(), Option::<Address>::None),
     );
-    
+
     // Also check that a stranger passed as admin is rejected
     let stranger = Address::generate(f.env());
     f.env().mock_all_auths();
@@ -199,7 +188,7 @@ fn test_set_position_nft_requires_admin_auth() {
         "set_position_nft",
         (f.admin.clone(), Option::<Address>::None),
     );
-    
+
     // Also check that a stranger passed as admin is rejected
     let stranger = Address::generate(f.env());
     f.env().mock_all_auths();
@@ -217,7 +206,7 @@ fn test_set_max_oracle_deviation_bps_requires_admin_auth() {
         "set_max_oracle_deviation_bps",
         (f.admin.clone(), 600_i128),
     );
-    
+
     // Also check that a stranger passed as admin is rejected
     let stranger = Address::generate(f.env());
     f.env().mock_all_auths();
@@ -236,7 +225,7 @@ fn test_propose_admin_requires_admin_auth() {
         "propose_admin",
         (f.admin.clone(), nominee.clone()),
     );
-    
+
     // Also check that a stranger passed as admin is rejected
     let stranger = Address::generate(f.env());
     f.env().mock_all_auths();
@@ -251,17 +240,17 @@ fn test_accept_admin_requires_nominee_auth() {
     let f = Fixture::new();
     let nominee = Address::generate(f.env());
     let stranger = Address::generate(f.env());
-    
+
     // Set up: propose a new admin
     f.env().mock_all_auths();
     f.client.propose_admin(&f.admin, &nominee);
-    
+
     // Verify a stranger cannot accept
     assert_eq!(
         f.client.try_accept_admin(&stranger),
         Err(Ok(ClError::Unauthorized))
     );
-    
+
     // Verify the nominee needs proper authorization
     f.check(&nominee, "accept_admin", (nominee.clone(),));
 }
@@ -296,7 +285,7 @@ fn test_set_protocol_fee_requires_admin_auth() {
         "set_protocol_fee",
         (f.admin.clone(), recipient.clone(), 10_i128),
     );
-    
+
     // Also check that a stranger passed as admin is rejected
     let stranger = Address::generate(f.env());
     f.env().mock_all_auths();
@@ -310,7 +299,7 @@ fn test_set_protocol_fee_requires_admin_auth() {
 fn test_withdraw_protocol_fees_requires_admin_auth() {
     let f = Fixture::new();
     f.check(&f.admin, "withdraw_protocol_fees", (f.admin.clone(),));
-    
+
     // Also check that a stranger passed as admin is rejected
     let stranger = Address::generate(f.env());
     f.env().mock_all_auths();
@@ -328,7 +317,7 @@ fn test_set_oracle_cardinality_requires_admin_auth() {
         "set_oracle_cardinality",
         (f.admin.clone(), 1024_u32),
     );
-    
+
     // Also check that a stranger passed as admin is rejected
     let stranger = Address::generate(f.env());
     f.env().mock_all_auths();

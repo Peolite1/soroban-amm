@@ -11629,9 +11629,9 @@ mod test_range_order_fill_status {
 mod tests_boundary_progress;
 
 #[cfg(test)]
-mod tests_bitmap_index;
-#[cfg(test)]
 mod auth_tests;
+#[cfg(test)]
+mod tests_bitmap_index;
 #[cfg(test)]
 mod tests_issue_1100;
 #[cfg(test)]
