@@ -312,11 +312,10 @@ impl TwalConsumer {
     pub fn save_snapshot(env: Env, pool: Address) -> Result<(), TwalError> {
         Self::extend_ttl(&env);
         Self::require_keeper(&env)?;
-        let (cum, pool_ts) =
-            match AmmPoolLiquidityClient::new(&env, &pool).try_get_liquidity_cumulative() {
-                Ok(Ok(v)) => v,
-                _ => return Err(TwalError::CrossContractCallFailed),
-            };
+        // The pool's accumulator only moves when something writes to the
+        // pool, so record it as of this ledger, not as of the pool's last
+        // write: readers time the window from the snapshot's ledger time.
+        let (cum, pool_ts) = Self::amm_cumulative_now(&env, &pool)?;
         Self::register_tracked_pool(&env, &pool, PoolType::Amm)?;
         Self::record_snapshot(&env, &pool, cum, pool_ts);
         Ok(())
@@ -416,8 +415,41 @@ impl TwalConsumer {
         Ok(x)
     }
 
-    /// Extrapolate the pool accumulator to ledger time using the same
-    /// geometric-mean liquidity formula as `amm::checkpoint_twal`.
+    /// The AMM pool's liquidity accumulator extrapolated to the current
+    /// ledger time, and the pool's own last-update timestamp.
+    ///
+    /// `get_liquidity_cumulative` returns the accumulator as of the pool's
+    /// last state-changing call, which can be arbitrarily far in the past
+    /// for an idle pool. Reserves cannot change without a checkpoint, so the
+    /// pool held its current liquidity for the whole idle stretch; this adds
+    /// that stretch using the same geometric-mean formula as
+    /// `amm::checkpoint_twal`. Both pool calls are made unconditionally, so
+    /// the footprint does not depend on the ledger clock (issue #985).
+    fn amm_cumulative_now(env: &Env, pool: &Address) -> Result<(i128, u64), TwalError> {
+        let client = AmmPoolLiquidityClient::new(env, pool);
+        let (cum_stored, pool_ts) = match client.try_get_liquidity_cumulative() {
+            Ok(Ok(value)) => value,
+            _ => return Err(TwalError::CrossContractCallFailed),
+        };
+        let info = match client.try_get_info() {
+            Ok(Ok(value)) => value,
+            _ => return Err(TwalError::CrossContractCallFailed),
+        };
+        let reserve_product = info
+            .reserve_a
+            .checked_mul(info.reserve_b)
+            .ok_or(TwalError::ArithmeticOverflow)?;
+        let liquidity = Self::integer_sqrt(reserve_product)?;
+        let idle_elapsed = env.ledger().timestamp().saturating_sub(pool_ts) as i128;
+        let cum_now = liquidity
+            .checked_mul(idle_elapsed)
+            .and_then(|delta| cum_stored.checked_add(delta))
+            .ok_or(TwalError::ArithmeticOverflow)?;
+        Ok((cum_now, pool_ts))
+    }
+
+    /// Difference the accumulator, extrapolated to ledger time, against the
+    /// floor snapshot, which `save_snapshot` recorded the same way.
     fn get_amm_twal_checked(
         env: &Env,
         pool: &Address,
@@ -434,25 +466,7 @@ impl TwalConsumer {
             return Err(TwalError::InsufficientHistory);
         }
 
-        let client = AmmPoolLiquidityClient::new(env, pool);
-        let (cum_stored, pool_ts_now) = match client.try_get_liquidity_cumulative() {
-            Ok(Ok(value)) => value,
-            _ => return Err(TwalError::CrossContractCallFailed),
-        };
-        let info = match client.try_get_info() {
-            Ok(Ok(value)) => value,
-            _ => return Err(TwalError::CrossContractCallFailed),
-        };
-        let reserve_product = info
-            .reserve_a
-            .checked_mul(info.reserve_b)
-            .ok_or(TwalError::ArithmeticOverflow)?;
-        let liquidity = Self::integer_sqrt(reserve_product)?;
-        let idle_elapsed = ledger_ts_now.saturating_sub(pool_ts_now) as i128;
-        let extrapolated = liquidity
-            .checked_mul(idle_elapsed)
-            .and_then(|delta| cum_stored.checked_add(delta))
-            .ok_or(TwalError::ArithmeticOverflow)?;
+        let (extrapolated, _) = Self::amm_cumulative_now(env, pool)?;
 
         let then_ts = ledger_ts_now - window_seconds;
         let (snapshot_ts, snapshot_cumulative, _) =
@@ -1183,6 +1197,125 @@ mod tests {
         let detailed = consumer.get_twal_liquidity_detailed(&amm_addr, &50);
         assert_eq!(detailed.twal, twal);
         assert_eq!(detailed.window_used, 75);
+    }
+
+    // -- snapshots of an idle AMM pool (issue #1488) ---------------------------
+
+    /// A real AMM pool initialized at t=9_990 and seeded with 1_000_000 of
+    /// each token at t=10_000, so its liquidity is 1_000_000 and its stored
+    /// accumulator timestamp is 10_000. Returns the pool, the token admin
+    /// clients, the provider and an initialized consumer.
+    fn setup_seeded_amm(
+        env: &Env,
+    ) -> (
+        Address,
+        StellarAssetClient<'_>,
+        StellarAssetClient<'_>,
+        Address,
+        TwalConsumerClient<'_>,
+    ) {
+        env.mock_all_auths();
+        env.ledger().set_timestamp(9_990);
+
+        let admin = Address::generate(env);
+        let amm_addr = env.register_contract(None, AmmPool);
+        let lp_addr = env.register_contract(None, LpToken);
+        token::LpTokenClient::new(env, &lp_addr).initialize(
+            &amm_addr,
+            &soroban_sdk::String::from_str(env, "LP"),
+            &soroban_sdk::String::from_str(env, "LP"),
+            &7u32,
+        );
+        let (ta, ta_sac) = create_sac(env, &admin);
+        let (tb, tb_sac) = create_sac(env, &admin);
+        AmmPoolClient::new(env, &amm_addr).initialize(
+            &admin,
+            &ta.address,
+            &tb.address,
+            &lp_addr,
+            &30_i128,
+            &admin,
+            &0_i128,
+        );
+
+        env.ledger().set_timestamp(10_000);
+        let provider = Address::generate(env);
+        ta_sac.mint(&provider, &1_000_000_i128);
+        tb_sac.mint(&provider, &1_000_000_i128);
+        AmmPoolClient::new(env, &amm_addr).add_liquidity(
+            &provider,
+            &1_000_000_i128,
+            &1_000_000_i128,
+            &0_i128,
+            &u64::MAX,
+        );
+
+        let consumer_addr = env.register_contract(None, TwalConsumer);
+        let consumer = TwalConsumerClient::new(env, &consumer_addr);
+        consumer.initialize(&admin);
+        (amm_addr, ta_sac, tb_sac, provider, consumer)
+    }
+
+    #[test]
+    fn test_twal_of_idle_pool_reports_its_constant_liquidity() {
+        let env = Env::default();
+        let (amm_addr, _ta, _tb, _provider, consumer) = setup_seeded_amm(&env);
+        assert_eq!(
+            AmmPoolClient::new(&env, &amm_addr).get_liquidity_cumulative(),
+            (0, 10_000)
+        );
+
+        // The pool has been idle for 500s when the keeper snapshots it, and
+        // stays idle. Its liquidity never moved off 1_000_000, so that is the
+        // average over any window. Recording the accumulator as of the pool's
+        // last write (10_000) while timing the window from the snapshot's
+        // ledger time (10_500) used to report 1_100s of liquidity over a 600s
+        // window: 1_833_333.
+        env.ledger().set_timestamp(10_500);
+        consumer.save_snapshot(&amm_addr);
+
+        env.ledger().set_timestamp(11_100);
+        let detailed = consumer.get_twal_liquidity_detailed(&amm_addr, &600);
+        assert_eq!(detailed.window_used, 600);
+        assert_eq!(detailed.twal, 1_000_000);
+    }
+
+    #[test]
+    fn test_twal_across_a_deposit_after_idle_snapshot_stays_within_bounds() {
+        // The timeline of the testnet smoke flow (scripts/e2e/twal_consumer.sh):
+        // seed, snapshot an idle pool, deposit, snapshot again a minute later,
+        // then read a window whose floor is the first snapshot.
+        let env = Env::default();
+        let (amm_addr, ta_sac, tb_sac, provider, consumer) = setup_seeded_amm(&env);
+
+        env.ledger().set_timestamp(10_015);
+        consumer.save_snapshot(&amm_addr);
+
+        env.ledger().set_timestamp(10_030);
+        ta_sac.mint(&provider, &500_000_i128);
+        tb_sac.mint(&provider, &500_000_i128);
+        AmmPoolClient::new(&env, &amm_addr).add_liquidity(
+            &provider,
+            &500_000_i128,
+            &500_000_i128,
+            &0_i128,
+            &u64::MAX,
+        );
+
+        env.ledger().set_timestamp(10_075);
+        consumer.save_snapshot(&amm_addr);
+
+        // window=30 at 10_080 floors to the 10_015 snapshot: 15s at 1_000_000
+        // then 50s at 1_500_000, over 65s.
+        env.ledger().set_timestamp(10_080);
+        let detailed = consumer.get_twal_liquidity_detailed(&amm_addr, &30);
+        assert_eq!(detailed.window_used, 65);
+        assert_eq!(
+            detailed.twal,
+            (1_000_000 * 15 + 1_500_000 * 50) / 65,
+            "TWAL must lie between the liquidity before and after the deposit"
+        );
+        assert!(detailed.twal >= 1_000_000 && detailed.twal <= 1_500_000);
     }
 
     #[test]
@@ -2015,6 +2148,7 @@ mod tests {
     /// its own module so its generated symbols don't collide with the other
     /// stub pools'.
     mod stub_amm_pool {
+        use super::AmmPoolInfo;
         use soroban_sdk::{contract, contractimpl, Env};
 
         #[contract]
@@ -2025,6 +2159,24 @@ mod tests {
             pub fn get_liquidity_cumulative(env: Env) -> (i128, u64) {
                 let ts = env.ledger().timestamp();
                 (ts as i128 * 1_000, ts)
+            }
+
+            /// Liquidity 1_000, matching the rate the cumulative grows at.
+            pub fn get_info(env: Env) -> AmmPoolInfo {
+                let addr = env.current_contract_address();
+                AmmPoolInfo {
+                    token_a: addr.clone(),
+                    token_b: addr.clone(),
+                    reserve_a: 1_000,
+                    reserve_b: 1_000,
+                    total_shares: 1_000,
+                    fee_bps: 30,
+                    flash_loan_fee_bps: 0,
+                    admin: addr.clone(),
+                    fee_recipient: addr,
+                    protocol_fee_bps: 0,
+                    lp_rebate_bps: 0,
+                }
             }
         }
     }

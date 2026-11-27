@@ -3,28 +3,14 @@
 # consumer: initialize -> save_snapshot -> change liquidity -> save again ->
 # get_twal_liquidity, plus the rejection paths and the batch readers.
 #
-# Waits for ledger time by polling the pool's own cumulative timestamp, not by
-# sleeping for a fixed period. Self-contained: deploys its own token pair,
-# AMM pool and twal_consumer instance, so it runs without deploy.sh:
+# Waits for ledger time by polling the network's latest ledger close time
+# (e2e_wait_for_ledger_time), not by sleeping for a fixed period. It must not
+# poll the pool's get_liquidity_cumulative() timestamp: that is the time of the
+# pool's last write and never moves while the flow only reads (issue #1488).
+# Self-contained: deploys its own token pair, AMM pool and twal_consumer
+# instance, so it runs without deploy.sh:
 #   bash scripts/e2e/twal_consumer.sh
 set -Eeuo pipefail
-
-# e2e_wait_for_timestamp POOL TARGET_TS — poll the pool's cumulative timestamp
-# until it reaches TARGET_TS. Fails with a clear message after 240 seconds.
-e2e_wait_for_timestamp() {
-  local pool="$1" target="$2" ts deadline
-  deadline=$(( $(date +%s) + 240 ))
-  while :; do
-    ts=$(invoke "$pool" get_liquidity_cumulative | grep -Eo '[0-9]+' | tail -n 1)
-    if (( ts >= target )); then
-      return 0
-    fi
-    if (( $(date +%s) >= deadline )); then
-      die "e2e_wait_for_timestamp: pool clock stuck at $ts, waited for $target"
-    fi
-    sleep 5
-  done
-}
 
 # twal_bool — reduce a bool result from the CLI ("true" / "false", maybe
 # quoted or padded) to its bare word.
@@ -64,8 +50,10 @@ run_twal_consumer_flow() {
   assert_contains "twal_consumer: paginated list includes the pool" \
     '@cmd:invoke "$twal" get_tracked_pools_paginated --offset 0 --limit 10' "$pool"
 
+  # Ledger time once the first snapshot has landed: the window starts here.
   local first_ts
-  first_ts=$(invoke "$pool" get_liquidity_cumulative | grep -Eo '[0-9]+' | tail -n 1)
+  first_ts=$(e2e_read_until "twal_consumer: latest ledger close time" 'e2e_ledger_time' _nonempty)
+  [[ -n "$first_ts" ]] || die "twal_consumer: could not read the latest ledger close time"
 
   # ── change liquidity, wait for ledger time, snapshot again ──────────────
   # The seeding deposit spent the keeper's minted balance, so mint more first.
@@ -81,9 +69,9 @@ run_twal_consumer_flow() {
   high=$(e2e_read_until "twal_consumer: total_shares after the deposit" \
     'invoke "$pool" get_info | grep -Eo '\''"total_shares":"?[0-9]+'\'' | grep -Eo '\''[0-9]+'\'' | tail -n 1' \
     _is_gt "$low")
-  local second_ts
-  second_ts=$(( first_ts + 60 ))
-  e2e_wait_for_timestamp "$pool" "$second_ts"
+  # The second snapshot must land at least a minute of ledger time after the
+  # first, so the TWAL window below spans the deposit.
+  e2e_wait_for_ledger_time "$(( first_ts + 60 ))"
   invoke "$twal" save_snapshot --pool "$pool" >/dev/null
   assert_eq "twal_consumer: second snapshot recorded" '@cmd:invoke "$twal" get_snapshot_count --pool "$pool" | parse_i128' "2"
 
