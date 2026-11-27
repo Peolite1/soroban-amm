@@ -13,6 +13,9 @@ import { describe, it } from "node:test";
 import { ApolloServer } from "@apollo/server";
 import { typeDefs } from "./schema.js";
 import { pubsub, resolvers } from "./resolvers.js";
+import { PoolIndexer } from "./indexer.js";
+import type { AlertConfig } from "./indexer.js";
+import type { AnalyticsStore } from "./store/interface.js";
 
 const server = new ApolloServer({ typeDefs, resolvers });
 
@@ -39,6 +42,16 @@ function assertBadUserInput(errors: ClientError[], message: RegExp) {
 }
 
 describe("BAD_USER_INPUT reaches clients", () => {
+  it("poolEvents rejects zero, negative, and oversized limits", async () => {
+    for (const limit of [0, -1, 1001]) {
+      const errors = await clientErrors(
+        "query ($limit: Int) { poolEvents(poolId: \"pool-1\", limit: $limit) { id } }",
+        { limit },
+      );
+      assertBadUserInput(errors, /limit must be an integer between 1 and 1000/);
+    }
+  });
+
   it("twal rejects a non-positive windowSeconds", async () => {
     for (const windowSeconds of [0, -60]) {
       const errors = await clientErrors(
@@ -71,10 +84,33 @@ describe("BAD_USER_INPUT reaches clients", () => {
     );
   });
 
+  it("setAlertConfig rejects an invalid comparison", async () => {
+    assertBadUserInput(
+      await clientErrors(
+        "mutation { setAlertConfig(poolId: \"pool-1\", metric: \"tvl\", comparison: \"sideways\", thresholdValue: 1) { poolId } }",
+      ),
+      /Invalid alert comparison "sideways"/,
+    );
+  });
+
+  it("setAlertConfig defaults an explicit null comparison to above", async () => {
+    const response = await server.executeOperation({
+      query:
+        "mutation ($c: String) { setAlertConfig(poolId: \"pool-null\", metric: \"tvl\", comparison: $c, thresholdValue: 5) { poolId comparison } }",
+      variables: { c: null },
+    });
+    assert.equal(response.body.kind, "single");
+    if (response.body.kind !== "single") return;
+    assert.equal(response.body.singleResult.errors, undefined);
+    assert.deepEqual(JSON.parse(JSON.stringify(response.body.singleResult.data)), {
+      setAlertConfig: { poolId: "pool-null", comparison: "above" },
+    });
+  });
+
   it("valid input returns data and no errors", async () => {
     const response = await server.executeOperation({
       query:
-        "mutation { setAlertConfig(poolId: \"pool-ok\", metric: \"price_deviation\", thresholdBps: 50) { poolId metric thresholdBps } }",
+        "mutation { setAlertConfig(poolId: \"pool-ok\", metric: \"price_deviation\", thresholdBps: 50) { poolId metric comparison thresholdBps } }",
     });
     assert.equal(response.body.kind, "single");
     if (response.body.kind !== "single") return;
@@ -82,8 +118,106 @@ describe("BAD_USER_INPUT reaches clients", () => {
     // Compare the serialized form a client receives; graphql-js builds the
     // result from null-prototype objects.
     assert.deepEqual(JSON.parse(JSON.stringify(response.body.singleResult.data)), {
-      setAlertConfig: { poolId: "pool-ok", metric: "price_deviation", thresholdBps: 50 },
+      setAlertConfig: { poolId: "pool-ok", metric: "price_deviation", comparison: "above", thresholdBps: 50 },
     });
+  });
+
+  it("accepts and returns a below comparison", async () => {
+    const response = await server.executeOperation({
+      query:
+        "mutation { setAlertConfig(poolId: \"pool-below\", metric: \"tvl\", comparison: \"below\", thresholdValue: 500) { poolId comparison thresholdValue } }",
+    });
+    assert.equal(response.body.kind, "single");
+    if (response.body.kind !== "single") return;
+    assert.equal(response.body.singleResult.errors, undefined);
+    assert.deepEqual(JSON.parse(JSON.stringify(response.body.singleResult.data)), {
+      setAlertConfig: { poolId: "pool-below", comparison: "below", thresholdValue: 500 },
+    });
+  });
+});
+
+describe("alert config mutations are durable-first (#1468)", () => {
+  function rejectingStore(): AnalyticsStore {
+    return {
+      setAlertConfig: async () => {
+        throw new Error("store write failed");
+      },
+      removeAlertConfig: async () => {
+        throw new Error("store write failed");
+      },
+    } as unknown as AnalyticsStore;
+  }
+
+  it("setAlertConfig leaves the in-memory config unchanged when the store write rejects", async () => {
+    const indexer = new PoolIndexer();
+    await assert.rejects(
+      async () => {
+        await resolvers.Mutation.setAlertConfig(
+          undefined,
+          { poolId: "pool-1", metric: "price_deviation", thresholdBps: 50 },
+          { indexer, store: rejectingStore() },
+        );
+      },
+      /store write failed/,
+    );
+    assert.deepEqual(indexer.getAlertConfigs(), []);
+  });
+
+  it("removeAlertConfig keeps the in-memory config when the store write rejects", async () => {
+    const indexer = new PoolIndexer();
+    const existing = indexer.setAlertConfig({
+      poolId: "pool-1",
+      metric: "price_deviation",
+      thresholdBps: 50,
+    });
+    await assert.rejects(
+      async () => {
+        await resolvers.Mutation.removeAlertConfig(
+          undefined,
+          { poolId: "pool-1", metric: "price_deviation" },
+          { indexer, store: rejectingStore() },
+        );
+      },
+      /store write failed/,
+    );
+    assert.deepEqual(indexer.getAlertConfigs(), [existing]);
+  });
+
+  it("applies the config to both indexer and store on success", async () => {
+    const indexer = new PoolIndexer();
+    const written: AlertConfig[] = [];
+    const store = {
+      setAlertConfig: async (config: AlertConfig) => {
+        written.push(config);
+        return config;
+      },
+      removeAlertConfig: async () => true,
+    } as unknown as AnalyticsStore;
+
+    const config = await resolvers.Mutation.setAlertConfig(
+      undefined,
+      { poolId: "pool-1", metric: "price_deviation", thresholdBps: 50 },
+      { indexer, store },
+    );
+    assert.deepEqual(config, {
+      poolId: "pool-1",
+      metric: "price_deviation",
+      comparison: "above",
+      thresholdBps: 50,
+      thresholdValue: undefined,
+    });
+    assert.deepEqual(indexer.getAlertConfigs(), [config]);
+    assert.deepEqual(written, [config]);
+
+    assert.equal(
+      await resolvers.Mutation.removeAlertConfig(
+        undefined,
+        { poolId: "pool-1", metric: "price_deviation" },
+        { indexer, store },
+      ),
+      true,
+    );
+    assert.deepEqual(indexer.getAlertConfigs(), []);
   });
 });
 

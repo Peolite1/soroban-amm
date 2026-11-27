@@ -20,7 +20,10 @@ import {
     InvalidWebhookUrlError,
     validateWebhookUrl,
 } from "./url-validation.js";
+import { verifySignature } from "./signing.js";
 import type { PoolEvent } from "./types.js";
+import type { Logger } from "./rpc-poller.js";
+import { MemoryStateStore } from "./storage.js";
 
 describe("WebhookRegistry", () => {
     it("registers and lists webhooks", () => {
@@ -196,6 +199,14 @@ const EVENT: PoolEvent = {
     timestamp: "2026-06-01T00:00:00Z",
     payload: { amountIn: 1000, amountOut: 990 },
 };
+
+function recordingWarnLogger(warnings: string[]): Logger {
+    return {
+        info: () => {},
+        warn: (msg) => { warnings.push(msg); },
+        error: () => {},
+    };
+}
 
 interface TestServer {
     url: string;
@@ -536,6 +547,70 @@ describe("local webhook delivery integration", () => {
                 await srv.close();
             }
         });
+
+        it("re-signs each retry attempt with a fresh timestamp while keeping X-Webhook-Id stable", async () => {
+            const srv = await startServer((hit) => ({
+                status: hit < 3 ? 500 : 200,
+            }));
+            const secret = "test-retry-secret";
+            const realDateNow = Date.now;
+            const baseSec = 1_700_000_000;
+            let nowMs = baseSec * 1_000;
+            Date.now = () => nowMs;
+            try {
+                const reg = new WebhookRegistry();
+                reg.register(srv.url, { secret });
+                const d = new WebhookDispatcher(reg, {
+                    timeoutMs: 200,
+                    maxRetries: 2,
+                    baseDelayMs: 10,
+                    maxDelayMs: 20,
+                    random: () => 0.5,
+                    deadLetterQueue: new DeadLetterQueue(100),
+                    circuitBreaker: new CircuitBreaker({
+                        failureThreshold: 100,
+                    }),
+                    sleep: async () => {
+                        nowMs += 200_000;
+                    },
+                });
+                const [r] = await d.dispatch(EVENT);
+                assert.equal(r.success, true);
+                assert.equal(srv.hits(), 3);
+
+                const reqHeaders = srv.headers();
+                const reqBodies = srv.bodies();
+                const ids = reqHeaders.map((h) => h["x-webhook-id"]);
+                assert.deepEqual(ids, [EVENT.id, EVENT.id, EVENT.id]);
+
+                const sigHeaders = reqHeaders.map((h, idx) => {
+                    const sigHeader = h["x-webhook-signature"];
+                    if (typeof sigHeader !== "string") {
+                        assert.fail("expected string X-Webhook-Signature header");
+                    }
+                    const match = /^t=(\d+),v1=[0-9a-f]{64}$/.exec(sigHeader);
+                    assert.ok(match, `invalid signature header: ${sigHeader}`);
+                    const expectedTs = baseSec + idx * 200;
+                    assert.equal(Number(match[1]), expectedTs);
+                    assert.deepEqual(
+                        verifySignature({
+                            secret,
+                            body: reqBodies[idx],
+                            header: sigHeader,
+                            now: expectedTs,
+                        }),
+                        { valid: true },
+                    );
+                    return sigHeader;
+                });
+
+                assert.notEqual(sigHeaders[0], sigHeaders[1]);
+                assert.notEqual(sigHeaders[1], sigHeaders[2]);
+            } finally {
+                Date.now = realDateNow;
+                await srv.close();
+            }
+        });
     });
 
     describe("backoff jitter", () => {
@@ -693,6 +768,67 @@ describe("local webhook delivery integration", () => {
             assert.equal(dlq.get(ids[1]), undefined);
         });
 
+        it("warns and counts exactly one eviction at maxEntries + 1", () => {
+            const warnings: string[] = [];
+            const dlq = new DeadLetterQueue(3, undefined, recordingWarnLogger(warnings));
+            const sub = { id: "s-sub", url: "http://x", createdAt: 0 };
+            const oldest = dlq.add({ ...EVENT, id: "evt-oldest" }, sub, [], "boom");
+            dlq.add({ ...EVENT, id: "evt-second" }, sub, [], "boom");
+            dlq.add({ ...EVENT, id: "evt-third" }, sub, [], "boom");
+
+            assert.equal(dlq.evictions, 0);
+            assert.equal(warnings.length, 0);
+
+            dlq.add({ ...EVENT, id: "evt-new" }, sub, [], "boom");
+
+            assert.equal(dlq.size, 3);
+            assert.equal(dlq.evictions, 1);
+            assert.equal(warnings.length, 1);
+            assert.ok(warnings[0].includes("[dead-letter] evicted oldest entry"));
+            assert.ok(warnings[0].includes(`deadLetterId=${oldest.id}`));
+            assert.ok(warnings[0].includes("event=evt-oldest"));
+            assert.ok(warnings[0].includes("subscription=s-sub"));
+        });
+
+        it("exposes dead-letter evictions through metrics", () => {
+            const dlq = new DeadLetterQueue(1, undefined, recordingWarnLogger([]));
+            const d = makeDispatcher(new WebhookRegistry(), { deadLetterQueue: dlq });
+            const sub = { id: "s-sub", url: "http://x", createdAt: 0 };
+
+            dlq.add({ ...EVENT, id: "evt-first" }, sub, [], "boom");
+            dlq.add({ ...EVENT, id: "evt-second" }, sub, [], "boom");
+
+            assert.equal(d.metrics().deadLetterEvictions, 1);
+            d.resetMetrics();
+            assert.equal(d.metrics().deadLetterEvictions, 0);
+        });
+
+        it("counts evictions when a persisted queue is loaded above capacity", () => {
+            const warnings: string[] = [];
+            const store = new MemoryStateStore();
+            const entries = [
+                { ...EVENT, id: "evt-old" },
+                { ...EVENT, id: "evt-new" },
+            ].map((event, i) => ({
+                id: String(i + 1),
+                event,
+                subscription: { id: "s-sub", url: "http://x", createdAt: 0 },
+                attempts: [],
+                failedAt: i + 1,
+                reason: "boom",
+            }));
+            store.saveDeadLetters({ entries, nextId: 3 });
+
+            const dlq = new DeadLetterQueue(1, store, recordingWarnLogger(warnings));
+
+            assert.equal(dlq.size, 1);
+            assert.equal(dlq.list()[0].event.id, "evt-new");
+            assert.equal(dlq.evictions, 1);
+            assert.equal(store.loadDeadLetters().entries.length, 1);
+            assert.ok(warnings[0].includes("when=on load"));
+            assert.ok(warnings[0].includes("event=evt-old"));
+        });
+
         it("rejects a non-positive capacity", () => {
             assert.throws(() => new DeadLetterQueue(0), RangeError);
         });
@@ -708,6 +844,18 @@ describe("local webhook delivery integration", () => {
             assert.equal(dlq.remove(e.id), true);
             assert.equal(dlq.remove(e.id), false);
             assert.equal(dlq.size, 0);
+        });
+
+        it("removes all dead letters for an unregistered subscription", () => {
+            const dlq = new DeadLetterQueue(5);
+            const removedSub = { id: "removed", url: "http://x", createdAt: 0 };
+            const retainedSub = { id: "retained", url: "http://y", createdAt: 0 };
+            dlq.add(EVENT, removedSub, [], "boom");
+            dlq.add(EVENT, retainedSub, [], "boom");
+
+            assert.equal(dlq.removeBySubscription(removedSub.id), 1);
+            assert.equal(dlq.size, 1);
+            assert.equal(dlq.list()[0].subscription.id, retainedSub.id);
         });
 
         it("replays successfully once the endpoint recovers, and clears the entry", async () => {
@@ -765,6 +913,29 @@ describe("local webhook delivery integration", () => {
             }
         });
 
+        it("does not deliver a replay after its subscription is unregistered", async () => {
+            const srv = await startServer(() => ({ status: 500 }));
+            try {
+                const reg = new WebhookRegistry();
+                const sub = reg.register(srv.url);
+                const dlq = new DeadLetterQueue(10);
+                const d = makeDispatcher(reg, {
+                    maxRetries: 0,
+                    deadLetterQueue: dlq,
+                });
+                const [failed] = await d.dispatch(EVENT);
+                const hitsBeforeReplay = srv.hits();
+
+                assert.equal(reg.unregister(sub.id), true);
+                const replayed = await d.replay(failed.deadLetterId!);
+
+                assert.equal(replayed!.failureKind, "subscription_gone");
+                assert.equal(srv.hits(), hitsBeforeReplay);
+            } finally {
+                await srv.close();
+            }
+        });
+
         it("returns undefined when replaying an unknown id", async () => {
             const d = makeDispatcher(new WebhookRegistry());
             assert.equal(await d.replay("nope"), undefined);
@@ -793,9 +964,11 @@ describe("local webhook delivery integration", () => {
                     failureThreshold: 1,
                     cooldownMs: 60_000,
                 });
+                const dlq = new DeadLetterQueue(10);
                 const d = makeDispatcher(reg, {
                     maxRetries: 0,
                     circuitBreaker: cb,
+                    deadLetterQueue: dlq,
                 });
 
                 await d.dispatch(EVENT);
@@ -804,12 +977,209 @@ describe("local webhook delivery integration", () => {
 
                 const [second] = await d.dispatch(EVENT);
                 assert.equal(second.failureKind, "circuit_open");
+                assert.equal(second.deadLettered, true);
                 assert.equal(
                     srv.hits(),
                     hitsAfterFirst,
                     "no request should be sent while open",
                 );
                 assert.equal(d.metrics().shortCircuited, 1);
+                assert.equal(d.metrics().deadLettered, 2);
+                const skipped = dlq.get(second.deadLetterId!);
+                assert.equal(skipped?.reason, "circuit open");
+            } finally {
+                await srv.close();
+            }
+        });
+
+        it("retains circuit-open skips in the dead-letter queue", async () => {
+            const srv = await startServer(() => ({ status: 200 }));
+            try {
+                const reg = new WebhookRegistry();
+                const sub = reg.register(srv.url);
+                const dlq = new DeadLetterQueue(10);
+                const cb = new CircuitBreaker({
+                    failureThreshold: 1,
+                    cooldownMs: 60_000,
+                });
+                cb.recordFailure(sub.id);
+                const d = makeDispatcher(reg, {
+                    maxRetries: 0,
+                    circuitBreaker: cb,
+                    deadLetterQueue: dlq,
+                });
+
+                const [skipped] = await d.dispatch({ ...EVENT, id: "circuit-open-retained" });
+                const retained = dlq.get(skipped.deadLetterId!);
+                assert.equal(skipped.deadLettered, true);
+                assert.equal(retained?.event.id, "circuit-open-retained");
+                assert.equal(retained?.reason, "circuit open");
+                assert.equal(srv.hits(), 0);
+            } finally {
+                await srv.close();
+            }
+        });
+
+        it("replays a circuit-open dead letter after the cooldown", async () => {
+            let recovered = false;
+            let now = 1_000;
+            const srv = await startServer(() => ({ status: recovered ? 200 : 500 }));
+            try {
+                const reg = new WebhookRegistry();
+                const sub = reg.register(srv.url);
+                const dlq = new DeadLetterQueue(10);
+                const cb = new CircuitBreaker({
+                    failureThreshold: 1,
+                    cooldownMs: 500,
+                    now: () => now,
+                });
+                cb.recordFailure(sub.id);
+                const d = makeDispatcher(reg, {
+                    maxRetries: 0,
+                    circuitBreaker: cb,
+                    deadLetterQueue: dlq,
+                });
+                const [skipped] = await d.dispatch({ ...EVENT, id: "circuit-open-replay" });
+                assert.ok(dlq.get(skipped.deadLetterId!));
+
+                recovered = true;
+                now += 500;
+                const replayed = await d.replay(skipped.deadLetterId!);
+                assert.equal(replayed?.success, true);
+                assert.equal(dlq.get(skipped.deadLetterId!), undefined);
+                assert.equal(cb.stateOf(sub.id), "closed");
+            } finally {
+                await srv.close();
+            }
+        });
+
+        it("counts circuit-open skips in the short-circuit and dead-letter metrics", async () => {
+            const srv = await startServer(() => ({ status: 200 }));
+            try {
+                const reg = new WebhookRegistry();
+                const sub = reg.register(srv.url);
+                const cb = new CircuitBreaker({ failureThreshold: 1, cooldownMs: 60_000 });
+                cb.recordFailure(sub.id);
+                const d = makeDispatcher(reg, {
+                    circuitBreaker: cb,
+                    deadLetterQueue: new DeadLetterQueue(10),
+                });
+                await d.dispatch({ ...EVENT, id: "circuit-open-metrics" });
+
+                assert.equal(d.metrics().shortCircuited, 1);
+                assert.equal(d.metrics().deadLettered, 1);
+                assert.equal(d.metrics().failed, 1);
+            } finally {
+                await srv.close();
+            }
+        });
+
+        it("counts an eviction when a circuit-open dead letter overflows the queue", async () => {
+            const srv = await startServer(() => ({ status: 500 }));
+            try {
+                const reg = new WebhookRegistry();
+                const sub = reg.register(srv.url);
+                const warnings: string[] = [];
+                const dlq = new DeadLetterQueue(1, undefined, recordingWarnLogger(warnings));
+                const cb = new CircuitBreaker({ failureThreshold: 1, cooldownMs: 60_000 });
+                const d = makeDispatcher(reg, {
+                    maxRetries: 0,
+                    circuitBreaker: cb,
+                    deadLetterQueue: dlq,
+                });
+
+                const [failed] = await d.dispatch({ ...EVENT, id: "evt-exhausted" });
+                assert.equal(cb.stateOf(sub.id), "open");
+                assert.equal(d.metrics().deadLetterEvictions, 0);
+
+                const [skipped] = await d.dispatch({ ...EVENT, id: "evt-circuit-open" });
+                assert.equal(skipped.failureKind, "circuit_open");
+                assert.equal(dlq.size, 1);
+                assert.equal(dlq.get(failed.deadLetterId!), undefined);
+                assert.equal(dlq.get(skipped.deadLetterId!)?.reason, "circuit open");
+                assert.equal(d.metrics().deadLetterEvictions, 1);
+                assert.equal(warnings.length, 1);
+                assert.ok(warnings[0].includes(`deadLetterId=${failed.deadLetterId}`));
+                assert.ok(warnings[0].includes("event=evt-exhausted"));
+            } finally {
+                await srv.close();
+            }
+        });
+
+        it("does not requeue or evict when a circuit-open entry is replayed before the cooldown", async () => {
+            const srv = await startServer(() => ({ status: 200 }));
+            try {
+                const reg = new WebhookRegistry();
+                const sub = reg.register(srv.url);
+                const warnings: string[] = [];
+                const dlq = new DeadLetterQueue(1, undefined, recordingWarnLogger(warnings));
+                const cb = new CircuitBreaker({ failureThreshold: 1, cooldownMs: 60_000 });
+                cb.recordFailure(sub.id);
+                const d = makeDispatcher(reg, {
+                    maxRetries: 0,
+                    circuitBreaker: cb,
+                    deadLetterQueue: dlq,
+                });
+                const [skipped] = await d.dispatch({ ...EVENT, id: "evt-early-replay" });
+
+                const replayed = await d.replay(skipped.deadLetterId!);
+
+                assert.equal(replayed?.failureKind, "circuit_open");
+                assert.equal(replayed?.deadLettered, undefined);
+                assert.equal(dlq.size, 1);
+                assert.ok(dlq.get(skipped.deadLetterId!), "entry stays retained");
+                assert.equal(d.metrics().deadLetterEvictions, 0);
+                assert.equal(warnings.length, 0);
+                assert.equal(srv.hits(), 0);
+            } finally {
+                await srv.close();
+            }
+        });
+
+        it("counts the eviction a failed replay causes at capacity, keeping the event", async () => {
+            const srv = await startServer(() => ({ status: 500 }));
+            try {
+                const reg = new WebhookRegistry();
+                reg.register(srv.url);
+                const warnings: string[] = [];
+                const dlq = new DeadLetterQueue(1, undefined, recordingWarnLogger(warnings));
+                const d = makeDispatcher(reg, { maxRetries: 0, deadLetterQueue: dlq });
+                const [failed] = await d.dispatch({ ...EVENT, id: "evt-replay-fails" });
+
+                const replayed = await d.replay(failed.deadLetterId!);
+
+                assert.equal(replayed?.success, false);
+                assert.equal(replayed?.deadLettered, true);
+                // The failed replay is recorded as a fresh entry; at capacity
+                // that evicts the original, and the eviction is counted.
+                assert.equal(dlq.size, 1);
+                assert.equal(dlq.get(failed.deadLetterId!), undefined);
+                assert.equal(dlq.get(replayed?.deadLetterId ?? "")?.event.id, "evt-replay-fails");
+                assert.equal(d.metrics().deadLetterEvictions, 1);
+                assert.equal(warnings.length, 1);
+                assert.ok(warnings[0].includes(`deadLetterId=${failed.deadLetterId}`));
+            } finally {
+                await srv.close();
+            }
+        });
+
+        it("does not count an eviction for a replay whose subscription is gone", async () => {
+            const srv = await startServer(() => ({ status: 500 }));
+            try {
+                const reg = new WebhookRegistry();
+                const sub = reg.register(srv.url);
+                const warnings: string[] = [];
+                const dlq = new DeadLetterQueue(1, undefined, recordingWarnLogger(warnings));
+                const d = makeDispatcher(reg, { maxRetries: 0, deadLetterQueue: dlq });
+                const [failed] = await d.dispatch({ ...EVENT, id: "evt-gone" });
+                assert.equal(reg.unregister(sub.id), true);
+
+                const replayed = await d.replay(failed.deadLetterId!);
+
+                assert.equal(replayed?.failureKind, "subscription_gone");
+                assert.equal(dlq.size, 1);
+                assert.equal(d.metrics().deadLetterEvictions, 0);
+                assert.equal(warnings.length, 0);
             } finally {
                 await srv.close();
             }

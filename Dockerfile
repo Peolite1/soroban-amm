@@ -24,15 +24,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # no need (and it would be wrong) to add wasm32-unknown-unknown here.
 
 # Install the Stellar CLI at the repo-wide pinned version. `.stellar-version`
-# is the single source of truth for this pin (also read by
-# .github/workflows/release.yml and .github/workflows/smoke-test.yml), so the
-# optimizer that produces release artifacts, the container contributors build
-# in, and the smoke test that verifies a deploy cannot drift to different
-# versions. `--locked` builds its own Cargo.lock with this image's compiler,
-# so the pinned version must be a release whose locked tree still compiles on
-# the toolchain above: 25.1.0 locks ethnum 1.5.2, which Rust 1.98.1 rejects
-# (E0512, cannot transmute between types of different sizes); 27.1.0 locks
-# ethnum 1.5.3, the version this workspace already builds with.
+# is the single source of truth for this pin — this Dockerfile reads it directly,
+# and .github/workflows/ci.yml, .github/workflows/release.yml, and
+# .github/workflows/smoke-test.yml pin the matching `stellar/stellar-cli@vX`
+# action tag (enforced by scripts/check_stellar_version.mjs) — so the optimizer
+# used for the release and the CLI that verifies a deploy cannot drift apart.
+# `--locked` builds the CLI's own Cargo.lock with this image's compiler.
 COPY .stellar-version /tmp/.stellar-version
 RUN cargo install stellar-cli --version "$(cat /tmp/.stellar-version)" --locked
 

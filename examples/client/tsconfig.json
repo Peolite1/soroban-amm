@@ -3,6 +3,7 @@
     "target": "ES2022",
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
+    "types": ["node"],
     "strict": true,
     "esModuleInterop": true,
     "forceConsistentCasingInFileNames": true,
@@ -10,5 +11,5 @@
     "outDir": "dist",
     "rootDir": "."
   },
-  "include": ["index.ts", "config.ts", "config.test.ts"]
+  "include": ["index.ts", "config.ts", "config.test.ts", "signer.ts", "swap.test.ts"]
 }
