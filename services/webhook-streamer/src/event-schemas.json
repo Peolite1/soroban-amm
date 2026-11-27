@@ -2131,6 +2131,26 @@
               "new_wasm_hash"
             ]
           }
+        ],
+        "paused": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "governance"
+            ]
+          }
+        ],
+        "unpaused": [
+          {
+            "version": 1,
+            "topics": 1,
+            "shape": "tuple",
+            "fields": [
+              "governance"
+            ]
+          }
         ]
       }
     },

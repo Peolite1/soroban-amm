@@ -265,7 +265,8 @@ export const CONTRACT_METADATA = {
       "10": "NotTreasury",
       "11": "InsufficientFunding",
       "12": "TooManySchedules",
-      "13": "LpTokenMismatch"
+      "13": "LpTokenMismatch",
+      "14": "Paused"
     },
     "structs": {
       "PolVesting": [
