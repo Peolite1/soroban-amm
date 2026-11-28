@@ -1,0 +1,34 @@
+# Only add a survivor after confirming it is an intentional non-coverage gap.
+# Every accepted entry needs the mutation id from the report (or from
+# `python3 scripts/mutation_check.py --crate <name> --list`) and a specific
+# justification. Ids are content based; see CONTRIBUTING.md.
+
+[crates.amm]
+
+[[crates.amm.accepted_survivors]]
+id = "error:get_amount_in:b1f64c9f0b"
+justification = """
+Unreachable: by this line reserve_in > 0, 0 < amount_out < reserve_out and
+fee_bps < 10_000, so numerator and denominator are both positive and
+numerator / denominator + 1 >= 1. The quotient cannot reach i128::MAX (the
+numerator is a multiple of 10_000 and the products are checked), so the + 1
+cannot wrap. The earlier `amount_out <= 0` guard in this function is covered
+by test_1097_get_amount_in_returns_typed_error_for_zero_or_negative_amount_out.
+"""
+
+[[crates.amm.accepted_survivors]]
+id = "error:swap_exact_out:188ef73303"
+justification = """
+Unreachable: amount_in comes from get_amount_in, which returns either an error
+or a quote of at least 1 (see error:get_amount_in:b1f64c9f0b). A zero or
+negative amount_out is rejected earlier in swap_exact_out by the guard covered
+by amount_guard_tests::test_swap_exact_out_reports_zero_amount_before_pool_and_token_checks.
+"""
+
+[crates.batch_auction]
+
+[crates.concentrated_liquidity]
+
+[crates.governance]
+
+[crates.token]

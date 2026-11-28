@@ -265,7 +265,8 @@ export const CONTRACT_METADATA = {
       "10": "NotTreasury",
       "11": "InsufficientFunding",
       "12": "TooManySchedules",
-      "13": "LpTokenMismatch"
+      "13": "LpTokenMismatch",
+      "14": "Paused"
     },
     "structs": {
       "PolVesting": [
@@ -445,7 +446,8 @@ export const CONTRACT_METADATA = {
       "18": "NotTracked",
       "19": "TooManyPools",
       "20": "NoPendingKeeper",
-      "21": "WrongPendingKeeper"
+      "21": "WrongPendingKeeper",
+      "22": "CannotDeleteRequiredSnapshot"
     },
     "structs": {
       "AmmPoolInfo": [
@@ -755,7 +757,8 @@ export const CONTRACT_METADATA = {
       "5": "TooManyRoutingTokens",
       "6": "NotInitialized",
       "7": "Paused",
-      "8": "Unauthorized"
+      "8": "Unauthorized",
+      "9": "InvalidFeeBps"
     },
     "structs": {
       "PriceImpactEstimate": [
@@ -887,7 +890,8 @@ export const CONTRACT_METADATA = {
       "19": "TooManyVenues",
       "20": "NotInitialized",
       "21": "InvalidBatchWindow",
-      "22": "InvalidWindowBounds"
+      "22": "InvalidWindowBounds",
+      "23": "Paused"
     },
     "structs": {
       "Order": [

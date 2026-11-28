@@ -108,8 +108,14 @@ Defined in [contracts/amm-sdk/src/types.rs](../contracts/amm-sdk/src/types.rs) a
 | 20 | `ProposalExpired` | Multisig emergency withdrawal proposal has expired. | Submit a new proposal. |
 | 21 | `NotInitialized` | Pool configuration was read before `initialize`. | Call `initialize` first. |
 | 22 | `PoolDrained` | Pool entered terminal `Drained` state after emergency withdrawal (#1095). | Deploy a new pool; drained pools are permanently retired. |
-| 23 | `QuorumNotMet` | Multisig emergency withdrawal approvals are below `MultisigQuorum` (#1095). | Collect enough signer approvals before executing. |
-| 24 | `NoPendingProposal` | `exec_multisig_emergency_wd` called with no active multisig proposal (#1095). | Call `propose_emergency_withdraw` first. |
+| 23 | `QuorumNotMet` | Legacy quorum code; no longer returned by the emergency path (see `QuorumNotReached`, #1095). | — |
+| 24 | `NoPendingProposal` | No emergency announcement or multisig proposal to act on: `emergency_withdraw` / `cancel_emergency_withdraw` without an announcement, or a multisig approve/exec with an unknown id or the wrong action (#1095). | Call `announce_emergency_withdraw` or `propose_emergency_withdraw` first and use the returned id. |
+| 25 | `QuorumNotReached` | `exec_multisig_emergency_wd` / `exec_multisig_set_multisig` called with fewer approvals than `MultisigQuorum`. | Collect more approvals with `approve_multisig_proposal`. |
+| 26 | `InvalidQuorum` | `set_multisig` / `propose_set_multisig` given `quorum > signers.len()` or duplicate signers. | Pass `quorum` in `0..=signers.len()` with unique signers. |
+| 27 | `EmergencyDelayNotElapsed` | Emergency withdrawal attempted before the emergency delay elapsed (since the announcement, or since multisig quorum). | Wait for the delay (24 h by default, at most 7 days). |
+| 28 | `InvalidRecipient` | Emergency recipient is the pool or its LP token, or differs from the announced recipient. | Pass the announced recipient, which may be neither the pool nor the LP token. |
+| 29 | `MultisigGuardActive` | `set_multisig` called while a multisig guard is active. | Change the signer set through `propose_set_multisig`. |
+| 30 | `InvalidEmergencyDelay` | `initialize_with_emergency_delay` given a delay above 7 days. | Pass at most `604800` seconds. |
 
 ---
 
@@ -186,6 +192,8 @@ Defined in [contracts/batch_router/src/lib.rs](../contracts/batch_router/src/lib
 | 14 | `NoPendingAdmin` | `accept_admin` called while no `propose_admin` nomination is pending. | Have the admin call `propose_admin` first. |
 | 15 | `Paused` | The router is paused by its admin; returned by `execute_batch`, `simulate_batch` and `validate_batch` alike. | Wait for the admin to call `unpause`. |
 | 16 | `PoolDrained` | The target AMM pool is in terminal drained state (or has empty reserves in simulation), so swap/liquidity simulation refuses to quote it. | Treat the pool as retired; route to a different pool. |
+| 17 | `InvalidFactory` | The `factory` address passed to `initialize` does not implement the factory interface (the `try_get_pool_count` probe failed). No storage is written. | Pass the address of a deployed, initialized factory contract; a rejected `initialize` leaves the router uninitialized, so it can be retried. |
+| 18 | `InvalidToken` | A CL `SwapOp` named a `token_in` the pool does not trade, or a `zero_for_one` direction contradicted by that token. Returned by `execute_batch`, `simulate_batch` and `validate_batch` alike. | Use one of the pool's tokens and set `zero_for_one = true` for token A, `false` for token B. |
 
 Current simulation note: `batch_router::simulate_batch` still does not replay AMM circuit-breaker and oracle-deviation checks, so those AMM guards can still diverge between simulation and execution.
 
@@ -217,7 +225,7 @@ Defined in [contracts/concentrated_liquidity/src/lib.rs](../contracts/concentrat
 | 18 | OracleDeviationExceeded | Spot price deviated beyond configured oracle tolerance during swap, or configured oracle returned non-positive price or confidence 0. | Wait for oracle price and confidence to stabilize or adjust tolerance. |
 | 19 | `NftNotConfigured` | Tokenization attempted when no NFT contract address is set in storage. | Call `set_nft_contract` with a valid position NFT contract. |
 | 20 | `NotNftOwner` | Caller is not current owner of position NFT. | Call method from NFT owner account. |
-| 21 | `NftContractChangeBlocked` | Admin attempted NFT contract change while tokenized positions exist. | Untokenize/burn active position NFTs before changing contract. |
+| 21 | `NftContractChangeBlocked` | Admin attempted to change or detach the NFT contract while tokenized positions exist. | Fully close and burn all tokenized positions before changing or detaching the contract. |
 | 22 | `RangeOrderExists` | Range order already active on specified range for caller. | Withdraw existing range order before placing a new one. |
 | 23 | `ExactOutNotFullyFilled` | `swap_exact_out` or `quote_exact_out` (#696) could not fill the requested `amount_out` in full before running out of initialized ticks or hitting `sqrt_price_limit_x96`. Exact-out has no meaningful partial fill. | Reduce `amount_out`, widen `sqrt_price_limit_x96`, or add liquidity to the range being traded against. |
 | 24 | `NotInitialized` | A function that depends on pool state (tokens, admin, current tick) was called before `initialize`. This covers the admin setters, every liquidity/swap/quote entrypoint, and the `current_tick`, `get_tokens`, and `fee_bps` views. | Call `initialize` first. |
@@ -248,9 +256,10 @@ Defined in [contracts/dex_aggregator/src/lib.rs](../contracts/dex_aggregator/src
 | 3 | `UnregisteredPool` | A route hop references a pool that is not registered with the factory. | Only route through pools registered via the factory. |
 | 4 | `InvalidMaxHops` | `set_max_hops` called with `0`. | Pass a positive hop count. |
 | 5 | `TooManyRoutingTokens` | `set_routing_tokens` called with more than `MAX_ROUTING_TOKENS` addresses. | Reduce the routing token list size. |
-| 6 | `NotInitialized` | An admin setter, quote, swap, or `pause`/`unpause` entrypoint was called before `initialize` (admin/factory unset). | Call `initialize` first. |
+| 6 | `NotInitialized` | An admin setter, quote, swap, `get_admin`/`get_factory`, `pause`/`unpause`, `propose_admin`, `upgrade` was called before `initialize`, or `accept_admin` was called without a pending nomination. | Call `initialize` (or `propose_admin` before `accept_admin`) first. |
 | 7 | `Paused` | A state-mutating entrypoint (`set_max_hops`, `register_cl_pool`, `set_routing_tokens`, `remove_cl_pool`, `execute_route`, `swap_best`) was called while the aggregator is paused. Quotes (`find_best_route`, `get_quote`, `is_price_within_tolerance`) stay callable. | Wait for the admin to call `unpause`; check `is_paused` first. |
 | 8 | `Unauthorized` | `pause` or `unpause` was called with an `admin` address that does not match the stored admin. | Pass the stored admin address and sign with its key. |
+| 9 | `InvalidFeeBps` | `register_cl_pool` was called with a `fee_bps` outside `[0, 10 000)`. | Use a fee in `0..=9 999`, mirroring the factory's validation. |
 
 ---
 
@@ -326,7 +335,7 @@ Defined in [contracts/cl_position_nft/src/lib.rs](../contracts/cl_position_nft/s
 | 2 | `Unauthorized` | A caller other than the registered `cl_pool` called `mint`/`burn`, or an admin-only operation (`propose_admin`, `upgrade`, `set_cl_pool`, `set_ttl_params`, `migrate_ownership_index`) was called by a non-admin or before `initialize`. | Use the registered pool address (for mint/burn) or the current admin address. |
 | 3 | `TokenNotFound` | `owner_of`, `position_meta`, `burn`, `approve`, or `transfer` referenced a `token_id` that does not exist (never minted, or already burned). | Verify token ownership with `owner_of`; `total_supply` is the live token count, and `total_minted` is cumulative. |
 | 4 | `NotOwnerOrApproved` | `transfer` called by an address that is neither the token's owner, its approved address, nor an approved operator for the owner. | Use the owner, an approved address, or an approved operator. |
-| 5 | `InvalidReceiver` | Reserved; not currently returned by any function. | — |
+| 5 | `InvalidReceiver` | `mint` or `transfer` targeted the Stellar all-zero address. | Mint or transfer to a valid address that can authorize transactions. |
 | 6 | `InvalidTtlConfig` | `set_ttl_params` was called with `bump_to < min_ttl_threshold`. | Ensure `bump_to >= min_ttl_threshold`. |
 | 7 | `TooManyPositions` | `mint` (or the `to` side of `transfer`) would push an owner's O(1)-indexed holdings past `MAX_POSITIONS_PER_OWNER` (10,000). Defence in depth introduced in #697, on top of the O(1) index fix itself. | Transfer or burn existing positions for that owner first. |
 | 8 | `ReceiverRefused` | `transfer` targeted an address that opted out of incoming transfers and did not approve the sender as an operator. | Ask the recipient to opt in or approve the sender as an operator. |
@@ -425,7 +434,7 @@ Defined in [contracts/incentive_campaigns/src/lib.rs](../contracts/incentive_cam
 | 11 | `CampaignNotFound` | No campaign exists with the given id. | Use an id returned by `create_campaign` / `list_campaigns_paginated`. |
 | 12 | `CampaignNotEnded` | `recover_leftover_funds` was called before `end_time`. | Wait for the campaign to end before recovering unallocated funds. |
 | 13 | `NoLeftoverFunds` | `recover_leftover_funds` found nothing left to recover. | No action needed; funds fully distributed. |
-| 14 | `CampaignInactive` | `claim_rewards` or `recover_leftover_funds` was called on a campaign that has already been deactivated by leftover recovery. | No further claims or recoveries are possible on this campaign. |
+| 14 | `CampaignInactive` | `claim_rewards`, `set_campaign_rate` or `recover_leftover_funds` was called on a campaign that has already been deactivated by leftover recovery. | No further claims, rate changes or recoveries are possible on this campaign. |
 | 15 | `CampaignNotStarted` | `claim_rewards` was called before `start_time`. | Wait for the campaign start timestamp. |
 | 16 | `NoLpBalance` | The claiming provider holds 0 LP tokens. | Deposit liquidity to earn LP tokens before claiming. |
 | 17 | `NoLpSupply` | The LP token's total supply is 0. | Seed the pool with liquidity. |
@@ -464,6 +473,7 @@ Defined in [contracts/pol_vesting/src/lib.rs](../contracts/pol_vesting/src/lib.r
 | 11 | `InsufficientFunding` | `create_vesting` for more tokens than the contract holds outside existing schedules. | Transfer the LP tokens to the contract before creating the schedule. |
 | 12 | `TooManySchedules` | Beneficiary already holds the maximum number of live schedules. | Revoke or move a schedule, or vest to a different beneficiary. |
 | 13 | `LpTokenMismatch` | `lp_token` is not administered by the given `pool`, or is not a token contract. | Pass the pool that issued the LP token. |
+| 14 | `Paused` | Governance-gated mutation called while the contract is paused. | Call `unpause` from governance, or wait. |
 
 ---
 
@@ -503,6 +513,7 @@ Defined in [contracts/router/src/lib.rs](../contracts/router/src/lib.rs) as `Rou
 | 11 | `InvalidFactory` | `initialize` could not call the factory's `get_pool_count` interface. | Pass a deployed factory contract address. |
 | 12 | `NoPendingAdmin` | `accept_admin` was called without a pending nomination. | Call `propose_admin` first. |
 | 13 | `PoolCallFailed` | A hop pool rejected a swap or quote call (e.g. paused, empty reserves, or another pool-level error). | Inspect the hop pools along the path (pause state, reserves, liquidity) before retrying. |
+| 14 | `PathTooLong` | The path has more than `MAX_PATH_LEN` (8) tokens (#1355). Every swap, quote and path view rejects it; `is_path_routable` returns `false`. | Split the route into paths of at most eight tokens. |
 
 ---
 
@@ -572,6 +583,9 @@ Defined in [contracts/oracle_adapters/src/lib.rs](../contracts/oracle_adapters/s
 | 7 | `InvalidPrice` | The computed TWAP price is zero or negative. | Check that the pool reserves and cumulative prices are positive. |
 | 8 | `ArithmeticOverflow` | A price conversion or scaling step overflowed. | Use a smaller amount or a pool with less extreme reserves. |
 | 9 | `CrossContractCallFailed` | A cross-contract call to the configured factory or TWAP consumer failed or panicked. | Verify the configured factory and TWAP consumer addresses and ensure the callee contracts are healthy. |
+| 10 | `Paused` | The adapter is paused and cannot quote. | Ask the administrator to unpause the adapter. |
+| 11 | `NoPendingAdmin` | There is no pending admin nomination. | Nominate a successor before accepting. |
+| 12 | `WrongPendingAdmin` | The caller is not the nominated admin. | Have the nominated account accept the transfer. |
 
 ---
 
