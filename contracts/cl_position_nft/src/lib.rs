@@ -38,10 +38,10 @@ pub enum NftError {
     NoPendingAdmin = 9,
     WrongAdmin = 10,
     InvalidAddress = 11,
+    /// `mint` supplied a pool address other than the registered `cl_pool`.
+    PoolMismatch = 12,
     /// `set_cl_pool` was called while position NFTs are still live.
-    PositionsExist = 12,
-    /// The `pool` address passed to `mint` doesn't match the registered CL pool.
-    PoolMismatch = 13,
+    PositionsExist = 13,
 }
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
