@@ -40,6 +40,8 @@ pub enum NftError {
     InvalidAddress = 11,
     /// `set_cl_pool` was called while position NFTs are still live.
     PositionsExist = 12,
+    /// The `pool` address passed to `mint` doesn't match the registered CL pool.
+    PoolMismatch = 13,
 }
 
 // ── Storage keys ─────────────────────────────────────────────────────────────
